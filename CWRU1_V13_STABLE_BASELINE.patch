@@ -1,0 +1,711 @@
+diff -ruN /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/README_CWRU1_V13_STABLE_BASELINE.md /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/README_CWRU1_V13_STABLE_BASELINE.md
+--- /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/README_CWRU1_V13_STABLE_BASELINE.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/README_CWRU1_V13_STABLE_BASELINE.md	2026-08-06 11:04:32.633547630 +0000
+@@ -0,0 +1,167 @@
++# CWRU_1 V13 基础稳定化版本
++
++## 1. 修改目标
++
++任务固定为：
++
++```text
++CWRU_0 + CWRU_2 + CWRU_3 -> CWRU_1
++```
++
++V12 日志显示：
++
++- 第 2 轮目标准确率最高；
++- 第 3 轮开始目标域迅速退化；
++- 源域准确率持续接近 100%，目标域却下降到约 68%；
++- ball_21 在救援开始前已经塌缩；
++- 后续伪标签救援无法恢复该类别。
++
++因此 V13 不再继续叠加伪标签救援，而是先稳定基础迁移过程。
++
++## 2. 网络结构没有改变
++
++仍然使用：
++
++- MSCNN-BiMamba 主干；
++- 3 个源域分支；
++- 3 个分类器；
++- 3 个 CDAN 域判别器；
++- 原有 CE、MMD、CDAN、CLMMD、SupCon 五类目标。
++
++V13 默认将 SupCon 权重设为 0，并关闭 V7-V12 的类别门控、专家保护、Hard-SupCon、原型救援和测试阶段类别救援。它们没有从项目中删除，只是不进入本次 V13 训练路径。
++
++## 3. 主要修改
++
++1. 优化器改为 Adam，学习率由 SGD 0.01 降为 Adam 0.0003。
++2. 适配系数增长速度由 `zeta=10` 降为 `zeta=2`。
++3. MMD 从第 2 轮开始，显式权重为 0.15。
++4. CDAN 从第 4 轮开始，权重为 0.002。
++5. CLMMD 从第 5 轮开始，权重为 0.0005。
++6. 目标伪标签阈值提高到 0.95，每类至少 3 个样本。
++7. 源域交叉熵加入 0.05 label smoothing。
++8. 梯度范数裁剪为 5.0。
++9. 关闭 V6 的不可逆源域门控，降低类别权重动态修正强度。
++10. 增加早停：第 6 轮以后，连续 4 轮无改善即停止。
++11. 每轮输出完整目标测试混淆矩阵和预测类别数量。
++
++## 4. 解压
++
++```bash
++cd "/workspace/故障诊断迁移学习/CWRU数据集迁移学习简化损失函数版本"
++unzip -o "MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete.zip"
++cd "MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete"
++```
++
++## 5. 数据检查
++
++```bash
++python check_cwru_dataset.py \
++  --data_dir "/workspace/CWRU_TL/CWRU" \
++  --signal_size 1024
++```
++
++## 6. 推荐运行命令
++
++```bash
++python run_cwru1_v13_stable_baseline.py \
++  --data_dir "/workspace/CWRU_TL/CWRU" \
++  --seeds 2027 \
++  --cuda_device 0
++```
++
++## 7. 后台运行
++
++```bash
++nohup python -u run_cwru1_v13_stable_baseline.py \
++  --data_dir "/workspace/CWRU_TL/CWRU" \
++  --seeds 2027 \
++  --cuda_device 0 \
++  > cwru1_v13_seed2027.log 2>&1 &
++```
++
++查看日志：
++
++```bash
++tail -f cwru1_v13_seed2027.log
++```
++
++## 8. 完整显式运行命令
++
++```bash
++python run_cwru1_v13_stable_baseline.py \
++  --data_dir "/workspace/CWRU_TL/CWRU" \
++  --seeds 2027 \
++  --cuda_device 0 \
++  --max_epoch 10 \
++  --batch_size 64 \
++  --num_workers 4 \
++  --signal_size 1024 \
++  --target_test_size 0.40 \
++  --source_balance_data True \
++  --normlize_type=-1-1 \
++  --optimizer adam \
++  --lr 0.0003 \
++  --weight_decay 0.0001 \
++  --lr_scheduler fix \
++  --zeta 2.0 \
++  --mmd_weight 0.15 \
++  --mmd_start_epoch 2 \
++  --lambda_adv 0.002 \
++  --adv_start_epoch 4 \
++  --lambda_clmmd 0.0005 \
++  --clmmd_start_epoch 5 \
++  --pl_conf_thresh 0.95 \
++  --pl_min_target 3 \
++  --source_label_smoothing 0.05 \
++  --grad_clip_norm 5.0 \
++  --cw_warmup_epochs 5 \
++  --cw_alpha 0.10 \
++  --cw_alpha_ramp_epochs 5 \
++  --rec_score_weight 0.10 \
++  --class_weight_power 1.0 \
++  --eval_each_epoch True \
++  --select_best_on_target True \
++  --best_metric class_aware \
++  --best_accuracy_weight 0.35 \
++  --best_macro_f1_weight 0.35 \
++  --best_focus_recall_weight 0.30 \
++  --early_stop_patience 4 \
++  --early_stop_min_epoch 6 \
++  --early_stop_min_delta 0.0001 \
++  --save_dir "./ckpt/CWRU1_V13_STABLE_BASELINE"
++```
++
++## 9. 日志中重点查看
++
++```text
++Target-Test-Class-2
++Target-Test-Class-6
++Target-Test predicted class counts
++Target-Test confusion true_c2
++Target-Test confusion true_c6
++Train-Acc Source Data
++Train-Acc Domain Data
++Target-Test-acc
++Target-Test-F1-macro
++Early stopping
++```
++
++类别映射：
++
++```text
++class 2 = ball_21
++class 6 = normal
++```
++
++`Target-Test confusion true_c2` 的一整行可以直接看出真实 ball_21 被分别错分到了哪些类别。
++
++## 10. 结果判断
++
++本版本首先验证基础训练是否稳定。成功的最低标准是：
++
++- 第 2 轮以后目标准确率不再立即大幅下降；
++- normal 召回率不再从 95% 快速跌到 20% 左右；
++- ball_21 的预测数量和错分方向可以通过混淆矩阵明确确认；
++- 源域准确率提高时，目标域准确率不再持续反向下降。
++
++本版本不能在没有真实数据运行的情况下保证 ball_21 一定提高。它的目的，是先消除 V12 中已经确认的早期负迁移，再依据混淆矩阵进行下一项单因素修改。
+diff -ruN /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED.py /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED.py
+--- /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED.py	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED.py	2026-08-06 11:02:35.346162280 +0000
+@@ -0,0 +1,65 @@
++# -*- coding: utf-8 -*-
++"""V13 CWRU_1 stabilized baseline without changing network structure.
++
++V13 intentionally removes the V7-V12 class-rescue stack from the training
++path and returns to the V6 five-term trainer.  The backbone, three source
++branches, classifiers, domain discriminators, feature dimensions and loss
++families remain unchanged.
++
++Only optimization policy is changed:
++- lower/smoother learning rate;
++- delayed and weak MMD/CDAN/CLMMD;
++- source label smoothing;
++- gradient clipping;
++- optional target-test early stopping;
++- detailed confusion-matrix diagnostics.
++"""
++
++import logging
++
++from models.MFSAN_CDAN_BIMAMBA_CW_RWCA_V6_LITE_PU0 import Trainer as V6Trainer
++
++
++class Trainer(V6Trainer):
++    """V6 network/trainer with V13 conservative optimization defaults."""
++
++    def __init__(self, args):
++        super(Trainer, self).__init__(args)
++        logging.info(
++            'Using model: MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED'
++        )
++        logging.info(
++            'V13 network structure unchanged: MSCNN-BiMamba backbone + three '
++            'source branches/classifiers + three CDAN discriminators.'
++        )
++        logging.info(
++            'V13 deliberately excludes V7-V12 class gates, specialists, '
++            'Hard-SupCon, prototype rescue and test-time class rescue.'
++        )
++        logging.info(
++            'V13 schedule: MMD starts={} (weight={:.4f}), CDAN starts={} '
++            '(lambda={:.6f}), CLMMD starts={} (lambda={:.6f}), '
++            'SupCon lambda={:.6f}.'.format(
++                self.mmd_start_epoch,
++                self.mmd_weight,
++                self.adv_start_epoch,
++                self.lambda_adv,
++                self.clmmd_start_epoch,
++                self.lambda_clmmd,
++                self.lambda_supcon,
++            )
++        )
++
++    def _checkpoint_dict(self):
++        checkpoint = super(Trainer, self)._checkpoint_dict()
++        checkpoint.update({
++            'v13_cwru1_baseline_stabilized': True,
++            'v13_network_structure_unchanged': True,
++            'v13_mmd_weight': float(self.mmd_weight),
++            'v13_mmd_start_epoch': int(self.mmd_start_epoch),
++            'v13_adv_start_epoch': int(self.adv_start_epoch),
++            'v13_clmmd_start_epoch': int(self.clmmd_start_epoch),
++            'v13_source_label_smoothing': float(self.source_label_smoothing),
++            'v13_grad_clip_norm': float(self.grad_clip_norm),
++        })
++        return checkpoint
+diff -ruN /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V2.py /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V2.py
+--- /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V2.py	2026-08-06 08:42:29.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V2.py	2026-08-06 11:02:08.652373505 +0000
+@@ -705,6 +705,10 @@
+         best_score = float('-inf')
+         best_acc = 0.0
+         best_epoch = 0
++        no_improve_epochs = 0
++        early_stop_patience = max(0, int(getattr(args, 'early_stop_patience', 0)))
++        early_stop_min_epoch = max(1, int(getattr(args, 'early_stop_min_epoch', 1)))
++        early_stop_min_delta = max(0.0, float(getattr(args, 'early_stop_min_delta', 0.0)))
+ 
+         for epoch in range(1, args.max_epoch + 1):
+             self._cur_epoch = epoch
+@@ -727,10 +731,15 @@
+                 if bool(getattr(args, 'select_best_on_target', True)):
+                     new_score = self._checkpoint_selection_score()
+                     metric_name = str(getattr(args, 'best_metric', 'accuracy'))
+-                    if new_score >= best_score:
++                    improved = (
++                        best_epoch == 0
++                        or new_score > best_score + early_stop_min_delta
++                    )
++                    if improved:
+                         best_score = new_score
+                         best_acc = new_acc
+                         best_epoch = epoch
++                        no_improve_epochs = 0
+                         if getattr(args, 'save', False) and getattr(args, 'save_best', True):
+                             if hasattr(self, 'save_best_model'):
+                                 self.save_best_model()
+@@ -742,6 +751,8 @@
+                                     best_epoch, best_acc, metric_name, best_score
+                                 )
+                             )
++                    else:
++                        no_improve_epochs += 1
+                     logging.info(
+                         'The best model epoch {}, target-test-acc {:.4f}, '
+                         '{} score {:.4f}'.format(
+@@ -756,6 +767,24 @@
+             if self.lr_scheduler is not None:
+                 self.lr_scheduler.step()
+ 
++            if (
++                early_stop_patience > 0
++                and epoch >= early_stop_min_epoch
++                and no_improve_epochs >= early_stop_patience
++            ):
++                logging.info(
++                    'Early stopping at epoch {}: no {} score improvement larger than {:.6f} '
++                    'for {} consecutive epochs. Best epoch={} score={:.4f}.'.format(
++                        epoch,
++                        str(getattr(args, 'best_metric', 'accuracy')),
++                        early_stop_min_delta,
++                        no_improve_epochs,
++                        best_epoch,
++                        best_score,
++                    )
++                )
++                break
++
+         if not bool(getattr(args, 'eval_each_epoch', True)):
+             logging.info(
+                 'Training finished; evaluating the held-out target set once (strict mode).'
+diff -ruN /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V6_LITE_PU0.py /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V6_LITE_PU0.py
+--- /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V6_LITE_PU0.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V6_LITE_PU0.py	2026-08-06 11:01:51.910905742 +0000
+@@ -48,6 +48,18 @@
+         # Explicit switch retained for ablation; PU0 Lite default is 0.
+         self.lambda_l1 = float(getattr(args, 'lambda_l1', 0.0))
+ 
++
++        # V13-style stabilization controls. These only change optimization
++        # timing/regularization; the network and the five existing losses are unchanged.
++        self.mmd_weight = max(0.0, float(getattr(args, 'mmd_weight', 1.0)))
++        self.mmd_start_epoch = max(1, int(getattr(args, 'mmd_start_epoch', 1)))
++        self.adv_start_epoch = max(1, int(getattr(args, 'adv_start_epoch', 1)))
++        self.clmmd_start_epoch = max(1, int(getattr(args, 'clmmd_start_epoch', 1)))
++        self.source_label_smoothing = min(
++            max(float(getattr(args, 'source_label_smoothing', 0.0)), 0.0), 0.5
++        )
++        self.grad_clip_norm = max(0.0, float(getattr(args, 'grad_clip_norm', 0.0)))
++
+         # ------------------------------------------------------------------
+         # Stable source gate
+         # ------------------------------------------------------------------
+@@ -123,6 +135,18 @@
+             )
+         )
+ 
++        logging.info(
++            'Stable optimization: mmd_weight={:.6f} starts={} | CDAN starts={} | '
++            'CLMMD starts={} | source_label_smoothing={:.4f} | grad_clip_norm={:.4f}'.format(
++                self.mmd_weight,
++                self.mmd_start_epoch,
++                self.adv_start_epoch,
++                self.clmmd_start_epoch,
++                self.source_label_smoothing,
++                self.grad_clip_norm,
++            )
++        )
++
+     # ------------------------------------------------------------------
+     # Save / load
+     # ------------------------------------------------------------------
+@@ -569,8 +593,18 @@
+             f_s_all = []
+             f_t_all = []
+ 
+-            adapt_tradeoff = self.tradeoff[2] if len(self.tradeoff) > 2 else 1.0
+-            grl_coeff = self.lambda_grl * adapt_tradeoff
++            base_adapt_tradeoff = self.tradeoff[2] if len(self.tradeoff) > 2 else 1.0
++            cur_epoch = int(getattr(self, '_cur_epoch', 1))
++            mmd_tradeoff = (
++                self.tradeoff[0] if cur_epoch >= self.mmd_start_epoch else 0.0
++            )
++            adv_tradeoff = (
++                base_adapt_tradeoff if cur_epoch >= self.adv_start_epoch else 0.0
++            )
++            clmmd_tradeoff = (
++                base_adapt_tradeoff if cur_epoch >= self.clmmd_start_epoch else 0.0
++            )
++            grl_coeff = self.lambda_grl * adv_tradeoff
+ 
+             for k in range(self.num_source):
+                 f_s = self.Fs[k](g_s_list[k])
+@@ -586,10 +620,15 @@
+                 probs_s_all.append(p_s)
+ 
+                 labels_s = source_label_list[k]
+-                loss_cls_vec_k = F.cross_entropy(y_s, labels_s, reduction='none')
++                loss_cls_vec_k = F.cross_entropy(
++                    y_s,
++                    labels_s,
++                    reduction='none',
++                    label_smoothing=self.source_label_smoothing,
++                )
+                 loss_mmd_k = self.mkmmd(f_s, f_t)
+ 
+-                if self.lambda_clmmd > 0.0:
++                if self.lambda_clmmd > 0.0 and clmmd_tradeoff > 0.0:
+                     # Expose the active source branch to subclasses such as V8,
+                     # which maintain source-specific class prototypes for CLMMD.
+                     self._active_source_idx_for_clmmd = k
+@@ -604,7 +643,7 @@
+                         self.num_classes, device=self.device
+                     )
+ 
+-                if self.lambda_adv > 0.0:
++                if self.lambda_adv > 0.0 and adv_tradeoff > 0.0:
+                     loss_adv_k, domain_acc_k = self._domain_adversarial_loss(
+                         cur_src_idx=k,
+                         f_s=f_s,
+@@ -701,7 +740,7 @@
+                 for k in range(self.num_source)
+             )
+ 
+-            if self.lambda_adv > 0.0:
++            if self.lambda_adv > 0.0 and adv_tradeoff > 0.0:
+                 loss_adv = sum(
+                     global_loss_src_weights[k] * loss_adv_list[k]
+                     for k in range(self.num_source)
+@@ -714,7 +753,7 @@
+                 loss_adv = zero()
+                 domain_acc = zero()
+ 
+-            if self.lambda_clmmd > 0.0:
++            if self.lambda_clmmd > 0.0 and clmmd_tradeoff > 0.0:
+                 clmmd_num = zero()
+                 clmmd_den = zero()
+                 for k in range(self.num_source):
+@@ -740,9 +779,9 @@
+             class_boost = self.v6_class_alignment_boost
+             loss = (
+                 loss_cls
+-                + self.tradeoff[0] * loss_mmd
+-                + adapt_tradeoff * self.lambda_adv * loss_adv
+-                + class_boost * adapt_tradeoff * self.lambda_clmmd * loss_clmmd
++                + self.mmd_weight * mmd_tradeoff * loss_mmd
++                + adv_tradeoff * self.lambda_adv * loss_adv
++                + class_boost * clmmd_tradeoff * self.lambda_clmmd * loss_clmmd
+                 + self.lambda_supcon * loss_supcon
+             )
+ 
+@@ -751,11 +790,14 @@
+             epoch_loss['MMD'] += loss_mmd.detach()
+             epoch_loss['CLMMD'] += loss_clmmd.detach()
+             epoch_loss['CDAN Domain'] += loss_adv.detach()
++            epoch_loss['MMD Weighted'] += (
++                self.mmd_weight * mmd_tradeoff * loss_mmd
++            ).detach()
+             epoch_loss['CLMMD Weighted'] += (
+-                class_boost * adapt_tradeoff * self.lambda_clmmd * loss_clmmd
++                class_boost * clmmd_tradeoff * self.lambda_clmmd * loss_clmmd
+             ).detach()
+             epoch_loss['CDAN Weighted'] += (
+-                adapt_tradeoff * self.lambda_adv * loss_adv
++                adv_tradeoff * self.lambda_adv * loss_adv
+             ).detach()
+             epoch_loss['SupCon'] += loss_supcon.detach()
+             epoch_loss['SupCon Weighted'] += (
+@@ -779,6 +821,19 @@
+                     epoch_loss[f'V6 Final CW Weight c{c} src{k}'] += class_src_weights[k, c].detach()
+ 
+             loss.backward()
++            if self.grad_clip_norm > 0.0:
++                trainable_params = [
++                    param
++                    for group in self.optimizer.param_groups
++                    for param in group['params']
++                    if param.grad is not None
++                ]
++                grad_norm = torch.nn.utils.clip_grad_norm_(
++                    trainable_params, self.grad_clip_norm
++                )
++                epoch_loss['Gradient Norm'] += torch.as_tensor(
++                    float(grad_norm), device=self.device
++                )
+             self.optimizer.step()
+ 
+         denom_iter = max(float(self.num_iter), 1.0)
+Binary files /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/models/__pycache__/MFSAN_CDAN_BIMAMBA_CW_RWCA_V12_CWRU1_STABLE_RESCUE.cpython-313.pyc and /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/models/__pycache__/MFSAN_CDAN_BIMAMBA_CW_RWCA_V12_CWRU1_STABLE_RESCUE.cpython-313.pyc differ
+diff -ruN /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/opt.py /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/opt.py
+--- /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/opt.py	2026-08-06 09:53:10.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/opt.py	2026-08-06 11:01:08.865527475 +0000
+@@ -92,6 +92,20 @@
+                              'Default three terms: MMD, L1, new adaptation losses.')
+     parser.add_argument('--zeta', type=float, default=10.0,
+                         help='Parameter to control the increasing rate of "exp" tradeoff')
++
++    # V13 stable-baseline optimization controls (training policy only)
++    parser.add_argument('--mmd_weight', type=float, default=1.0,
++                        help='Explicit multiplier for the existing MMD term; does not add a new loss.')
++    parser.add_argument('--mmd_start_epoch', type=int, default=1,
++                        help='First epoch applying MMD. Earlier epochs use source classification only for this term.')
++    parser.add_argument('--adv_start_epoch', type=int, default=1,
++                        help='First epoch applying the existing CDAN adversarial term.')
++    parser.add_argument('--clmmd_start_epoch', type=int, default=1,
++                        help='First epoch applying the existing class-wise MMD term.')
++    parser.add_argument('--source_label_smoothing', type=float, default=0.0,
++                        help='Label smoothing for source cross-entropy; 0 keeps the original behavior.')
++    parser.add_argument('--grad_clip_norm', type=float, default=0.0,
++                        help='Clip total gradient norm before optimizer.step; <=0 disables clipping.')
+     parser.add_argument('--lambda_l1', type=float, default=0.0,
+                         help='Weight of target prediction L1 consistency. V6-Lite-PU0 defaults to 0 and skips this loss.')
+     parser.add_argument('--dropout', type=float, default=0., help='Dropout layer coefficient')
+@@ -154,6 +168,15 @@
+     parser.add_argument('--best_focus_recall_weight', type=float, default=0.20,
+                         help='Focus-class recall weight for best_metric=class_aware.')
+ 
++    parser.add_argument('--early_stop_patience', type=int, default=0,
++                        help='Stop after this many epochs without checkpoint-score improvement; 0 disables early stopping.')
++    parser.add_argument('--early_stop_min_epoch', type=int, default=1,
++                        help='Do not early-stop before this epoch.')
++    parser.add_argument('--early_stop_min_delta', type=float, default=0.0,
++                        help='Minimum checkpoint-score increase counted as an improvement.')
++    parser.add_argument('--log_confusion_matrix', type=str2bool, default=True,
++                        help='Log target-test prediction counts and the full confusion matrix after each evaluation.')
++
+     # BiMamba small-gate backbone parameters
+     parser.add_argument('--bimamba_stem_channels', type=int, default=64,
+                         help='Stem channels for BiMamba-Attention auxiliary branch.')
+diff -ruN /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/run_cwru1_v13_stable_baseline.py /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/run_cwru1_v13_stable_baseline.py
+--- /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/run_cwru1_v13_stable_baseline.py	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/run_cwru1_v13_stable_baseline.py	2026-08-06 11:03:48.675253031 +0000
+@@ -0,0 +1,160 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Run the next-step CWRU_1 stabilized baseline experiment.
++
++Task: CWRU_0 + CWRU_2 + CWRU_3 -> CWRU_1.
++The network structure is unchanged. This launcher removes the V7-V12 rescue
++stack and uses a conservative staged schedule for the original V6 losses.
++"""
++
++import argparse
++import subprocess
++import sys
++from pathlib import Path
++
++
++def build_command(args, seed):
++    train_py = Path(__file__).resolve().parent / 'train.py'
++    return [
++        sys.executable,
++        str(train_py),
++        '--model_name',
++        'MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED',
++        '--dataset_profile', 'cwru',
++        '--cwru_apply_general_defaults', 'False',
++        '--source', 'CWRU_0,CWRU_2,CWRU_3',
++        '--target', 'CWRU_1',
++        '--train_mode', 'multi_source',
++        '--data_dir', str(Path(args.data_dir).expanduser()),
++        '--include_faults',
++        'ball_07,ball_14,ball_21,inner_07,inner_14,inner_21,normal,outer_07,outer_14,outer_21',
++        '--signal_size', str(args.signal_size),
++        '--backbone', 'CNN',
++        '--cuda_device', args.cuda_device,
++        '--max_epoch', str(args.max_epoch),
++        '--batch_size', str(args.batch_size),
++        '--num_workers', str(args.num_workers),
++        '--random_state', str(seed),
++        '--target_test_size', str(args.target_test_size),
++        '--target_split_mode', 'time',
++        '--source_balance_data', str(args.source_balance_data),
++        '--normlize_type={}'.format(args.normlize_type),
++
++        # Smoother optimizer than the former SGD lr=0.01 run.
++        '--opt', args.optimizer,
++        '--lr', str(args.lr),
++        '--weight_decay', str(args.weight_decay),
++        '--lr_scheduler', args.lr_scheduler,
++        '--gamma', str(args.gamma),
++        '--steps', str(args.steps),
++
++        # Slow adaptation ramp. The five loss families remain unchanged.
++        '--zeta', str(args.zeta),
++        '--mmd_weight', str(args.mmd_weight),
++        '--mmd_start_epoch', str(args.mmd_start_epoch),
++        '--lambda_adv', str(args.lambda_adv),
++        '--adv_start_epoch', str(args.adv_start_epoch),
++        '--lambda_clmmd', str(args.lambda_clmmd),
++        '--clmmd_start_epoch', str(args.clmmd_start_epoch),
++        '--lambda_supcon', '0.0',
++        '--lambda_l1', '0.0',
++        '--lambda_cda', '0.0',
++        '--lambda_ent', '0.0',
++        '--lambda_mca', '0.0',
++        '--pl_conf_thresh', str(args.pl_conf_thresh),
++        '--pl_min_target', str(args.pl_min_target),
++        '--source_label_smoothing', str(args.source_label_smoothing),
++        '--grad_clip_norm', str(args.grad_clip_norm),
++
++        # Keep reliability weighting mild and avoid irreversible source removal.
++        '--cw_warmup_epochs', str(args.cw_warmup_epochs),
++        '--cw_alpha', str(args.cw_alpha),
++        '--cw_alpha_ramp_epochs', str(args.cw_alpha_ramp_epochs),
++        '--rec_score_weight', str(args.rec_score_weight),
++        '--v6_gate_enabled', 'False',
++        '--v6_class_weight_power', str(args.class_weight_power),
++        '--v6_class_alignment_boost', '1.0',
++        '--v6_mca_pairwise_weight', '0.0',
++        '--v6_gate_apply_to_supcon', 'False',
++
++        # PU-style target-test checkpoint selection, with class-2 emphasis.
++        '--eval_each_epoch', str(args.eval_each_epoch),
++        '--select_best_on_target', str(args.select_best_on_target),
++        '--save_best', str(args.select_best_on_target),
++        '--best_metric', args.best_metric,
++        '--best_focus_class', '2',
++        '--best_accuracy_weight', str(args.best_accuracy_weight),
++        '--best_macro_f1_weight', str(args.best_macro_f1_weight),
++        '--best_focus_recall_weight', str(args.best_focus_recall_weight),
++        '--early_stop_patience', str(args.early_stop_patience),
++        '--early_stop_min_epoch', str(args.early_stop_min_epoch),
++        '--early_stop_min_delta', str(args.early_stop_min_delta),
++        '--log_confusion_matrix', 'True',
++        '--save_dir', args.save_dir,
++    ]
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--data_dir', required=True)
++    parser.add_argument('--seeds', default='2027')
++    parser.add_argument('--cuda_device', default='0')
++    parser.add_argument('--max_epoch', type=int, default=10)
++    parser.add_argument('--batch_size', type=int, default=64)
++    parser.add_argument('--num_workers', type=int, default=4)
++    parser.add_argument('--signal_size', type=int, default=1024)
++    parser.add_argument('--target_test_size', type=float, default=0.40)
++    parser.add_argument('--source_balance_data', choices=['True', 'False'], default='True')
++    parser.add_argument('--normlize_type', choices=['0-1', '-1-1', 'mean-std'], default='-1-1')
++
++    parser.add_argument('--optimizer', choices=['sgd', 'adam'], default='adam')
++    parser.add_argument('--lr', type=float, default=3e-4)
++    parser.add_argument('--weight_decay', type=float, default=1e-4)
++    parser.add_argument('--lr_scheduler', choices=['fix', 'stepLR', 'step', 'exp'], default='fix')
++    parser.add_argument('--gamma', type=float, default=0.5)
++    parser.add_argument('--steps', default='5')
++
++    parser.add_argument('--zeta', type=float, default=2.0)
++    parser.add_argument('--mmd_weight', type=float, default=0.15)
++    parser.add_argument('--mmd_start_epoch', type=int, default=2)
++    parser.add_argument('--lambda_adv', type=float, default=0.002)
++    parser.add_argument('--adv_start_epoch', type=int, default=4)
++    parser.add_argument('--lambda_clmmd', type=float, default=0.0005)
++    parser.add_argument('--clmmd_start_epoch', type=int, default=5)
++    parser.add_argument('--pl_conf_thresh', type=float, default=0.95)
++    parser.add_argument('--pl_min_target', type=int, default=3)
++    parser.add_argument('--source_label_smoothing', type=float, default=0.05)
++    parser.add_argument('--grad_clip_norm', type=float, default=5.0)
++
++    parser.add_argument('--cw_warmup_epochs', type=int, default=5)
++    parser.add_argument('--cw_alpha', type=float, default=0.10)
++    parser.add_argument('--cw_alpha_ramp_epochs', type=int, default=5)
++    parser.add_argument('--rec_score_weight', type=float, default=0.10)
++    parser.add_argument('--class_weight_power', type=float, default=1.0)
++
++    parser.add_argument('--eval_each_epoch', choices=['True', 'False'], default='True')
++    parser.add_argument('--select_best_on_target', choices=['True', 'False'], default='True')
++    parser.add_argument('--best_metric', choices=['accuracy', 'macro_f1', 'class_aware'], default='class_aware')
++    parser.add_argument('--best_accuracy_weight', type=float, default=0.35)
++    parser.add_argument('--best_macro_f1_weight', type=float, default=0.35)
++    parser.add_argument('--best_focus_recall_weight', type=float, default=0.30)
++    parser.add_argument('--early_stop_patience', type=int, default=4)
++    parser.add_argument('--early_stop_min_epoch', type=int, default=6)
++    parser.add_argument('--early_stop_min_delta', type=float, default=1e-4)
++    parser.add_argument('--save_dir', default='./ckpt/CWRU1_V13_STABLE_BASELINE')
++    parser.add_argument('--dry_run', action='store_true')
++    args = parser.parse_args()
++
++    seeds = [int(item.strip()) for item in args.seeds.split(',') if item.strip()]
++    if not seeds:
++        raise ValueError('At least one integer seed is required.')
++
++    for seed in seeds:
++        command = build_command(args, seed)
++        print('\nRUN:', ' '.join(command), flush=True)
++        if not args.dry_run:
++            subprocess.run(command, check=True)
++
++
++if __name__ == '__main__':
++    main()
+diff -ruN /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/train_utils.py /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/train_utils.py
+--- /tmp/v12fixed/MFSAN_BiMamba_CWRU1_stable_fix_complete/train_utils.py	2026-08-06 08:37:54.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_v13_stable_baseline_complete/train_utils.py	2026-08-06 11:02:20.605213563 +0000
+@@ -435,6 +435,40 @@
+                 'Target-Test-Recall-weighted: {:.4f}'.format(weighted_recall)
+             )
+ 
++            if bool(getattr(self.args, 'log_confusion_matrix', True)):
++                predicted_counts = {
++                    int(cls): int((preds == cls).sum().item())
++                    for cls in unique_classes
++                }
++                logging.info(
++                    'Target-Test predicted class counts: {}'.format(
++                        ', '.join(
++                            'c{}={}'.format(cls, predicted_counts[cls])
++                            for cls in unique_classes
++                        )
++                    )
++                )
++                logging.info(
++                    'Target-Test confusion matrix rows=true, cols=pred; class_order={}'.format(
++                        unique_classes
++                    )
++                )
++                confusion_matrix = []
++                for true_cls in unique_classes:
++                    row = [
++                        int(((labels == true_cls) & (preds == pred_cls)).sum().item())
++                        for pred_cls in unique_classes
++                    ]
++                    confusion_matrix.append(row)
++                    logging.info(
++                        'Target-Test confusion true_c{}: {}'.format(
++                            true_cls, ','.join(str(value) for value in row)
++                        )
++                    )
++                self.last_eval_metrics['predicted_counts'] = predicted_counts
++                self.last_eval_metrics['confusion_matrix'] = confusion_matrix
++                self.last_eval_metrics['class_order'] = [int(x) for x in unique_classes]
++
+         if hasattr(self, '_eval_source_weight_sum') and hasattr(
+             self, '_eval_source_weight_count'
+         ):

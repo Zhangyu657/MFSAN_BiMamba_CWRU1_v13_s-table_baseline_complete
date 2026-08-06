@@ -1,0 +1,926 @@
+--- /mnt/data/MFSAN_BiMamba_CWRU1_fix_complete/opt.py	2026-08-06 08:37:03.773815783 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_stable_fix_complete/opt.py	2026-08-06 09:53:10.233007870 +0000
+@@ -468,5 +468,58 @@
+     parser.add_argument('--v11_eval_boost', type=float, default=2.00,
+                         help='Multiplicative boost applied to the rescue class before final renormalization.')
+ 
++
++    # V12: stable CWRU-1 rescue without changing the network architecture
++    parser.add_argument('--v12_rescue_enabled', type=str2bool, default=False,
++                        help='Enable the delayed, capped, normal-protected class rescue used by V12.')
++    parser.add_argument('--v12_rescue_class', type=int, default=2,
++                        help='Target class rescued by V12; CWRU ball_21 is class 2.')
++    parser.add_argument('--v12_normal_class', type=int, default=6,
++                        help='Normal class index used by the V12 exclusion guards.')
++    parser.add_argument('--v12_confusion_classes', type=str, default='0,1',
++                        help='Classes that absorb the rescue class, e.g. ball_07 and ball_14.')
++    parser.add_argument('--v12_rescue_source_indices', type=str, default='2',
++                        help='Comma-separated source branch indices allowed to supply rescue CLMMD; source 2 is CWRU_3 in the dedicated task.')
++    parser.add_argument('--v12_rescue_start_epoch', type=int, default=6,
++                        help='First epoch enabling stable rescue.')
++    parser.add_argument('--v12_rescue_end_epoch', type=int, default=10,
++                        help='Last epoch enabling stable rescue, limiting late pseudo-label drift.')
++    parser.add_argument('--v12_rescue_topk', type=int, default=2,
++                        help='The rescue class must appear in the branch top-k predictions.')
++    parser.add_argument('--v12_rescue_min_class_prob', type=float, default=0.20,
++                        help='Minimum rescue-class probability for a target candidate.')
++    parser.add_argument('--v12_rescue_min_competitor_ratio', type=float, default=0.50,
++                        help='Rescue probability must reach this fraction of the strongest confusion-class probability.')
++    parser.add_argument('--v12_rescue_max_normal_prob', type=float, default=0.20,
++                        help='Reject target candidates whose normal-class probability exceeds this value.')
++    parser.add_argument('--v12_rescue_proto_margin', type=float, default=0.08,
++                        help='Minimum top1-top2 source-prototype cosine margin.')
++    parser.add_argument('--v12_rescue_normal_proto_margin', type=float, default=0.10,
++                        help='Minimum cosine-similarity advantage of rescue prototype over normal prototype.')
++    parser.add_argument('--v12_rescue_min_similarity', type=float, default=0.45,
++                        help='Minimum cosine similarity to the rescue-class source prototype.')
++    parser.add_argument('--v12_rescue_radius_cap', type=float, default=0.05,
++                        help='Maximum allowed source-prototype radius for rescued target samples.')
++    parser.add_argument('--v12_rescue_max_per_batch', type=int, default=4,
++                        help='Maximum number of rescued target samples per source branch and mini-batch.')
++    parser.add_argument('--v12_rescue_min_target', type=int, default=2,
++                        help='Minimum selected rescue samples required to compute the rescue CLMMD component.')
++    parser.add_argument('--v12_rescue_mix_alpha', type=float, default=0.25,
++                        help='Blend ratio of rescue CLMMD with the original class-wise CLMMD value.')
++    parser.add_argument('--v12_rescue_clmmd_boost', type=float, default=1.10,
++                        help='Small multiplier applied to the filtered rescue CLMMD component.')
++    parser.add_argument('--v12_rescue_score_tau', type=float, default=0.10,
++                        help='Temperature used to rank filtered rescue candidates before the per-batch cap.')
++    parser.add_argument('--v12_eval_rescue_enabled', type=str2bool, default=False,
++                        help='Optional evaluation-time calibration; disabled in the recommended experiment.')
++    parser.add_argument('--v12_eval_min_class_prob', type=float, default=0.20,
++                        help='Minimum fused rescue-class probability for optional evaluation calibration.')
++    parser.add_argument('--v12_eval_competitor_ratio', type=float, default=0.60,
++                        help='Optional evaluation rescue-to-competitor probability ratio.')
++    parser.add_argument('--v12_eval_min_source_votes', type=int, default=2,
++                        help='Minimum source branches voting for the rescue class during optional evaluation calibration.')
++    parser.add_argument('--v12_eval_boost', type=float, default=1.25,
++                        help='Optional small evaluation-time rescue probability multiplier.')
++
+     args = parser.parse_args()
+     return args
+--- /dev/null	2026-08-06 08:21:07.070397883 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_stable_fix_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V12_CWRU1_STABLE_RESCUE.py	2026-08-06 09:52:48.209701814 +0000
+@@ -0,0 +1,538 @@
++# -*- coding: utf-8 -*-
++"""V12: stable CWRU_1 class-rescue strategy without changing network structure.
++
++This trainer keeps the exact V10 network modules and the same five loss terms.
++Only the training policy for the existing class-wise MMD term is changed.
++
++The CWRU_1 logs showed that the former V11 rescue accepted hundreds of target
++samples in later epochs, while class-2 precision/recall remained poor and the
++normal class collapsed.  V12 therefore changes rescue from "many permissive
++pseudo labels" to "few high-quality pseudo labels":
++
++* delayed, time-limited rescue;
++* rescue from the configured class specialist only;
++* probability-ratio and normal-probability guards;
++* explicit separation from the normal-class prototype;
++* stricter prototype similarity/margin/radius requirements;
++* top-score cap per mini-batch;
++* conservative blending with the original CLMMD value instead of replacement;
++* no evaluation-time probability rewriting by default.
++
++No convolution, BiMamba, feature extractor, classifier, discriminator, or
++fusion architecture is added, removed, or resized.
++"""
++
++import logging
++from typing import List
++
++import torch
++import torch.nn.functional as F
++
++from models.MFSAN_CDAN_BIMAMBA_CW_RWCA_V10_PAIRWISE_SPECIALIST_CALIBRATED import (
++    Trainer as V10Trainer,
++)
++
++
++class Trainer(V10Trainer):
++    """V10 architecture with a stricter class-2 training policy."""
++
++    def __init__(self, args):
++        super(Trainer, self).__init__(args)
++
++        self.v12_rescue_enabled = bool(
++            getattr(args, 'v12_rescue_enabled', False)
++        )
++        self.v12_rescue_class = int(getattr(args, 'v12_rescue_class', 2))
++        self.v12_normal_class = int(getattr(args, 'v12_normal_class', 6))
++        self.v12_confusion_classes = self._parse_class_list(
++            getattr(args, 'v12_confusion_classes', '0,1'),
++            excluded={self.v12_normal_class},
++        )
++        self.v12_rescue_source_indices = self._parse_source_list(
++            getattr(args, 'v12_rescue_source_indices', '2')
++        )
++
++        self.v12_rescue_start_epoch = max(
++            1, int(getattr(args, 'v12_rescue_start_epoch', 6))
++        )
++        self.v12_rescue_end_epoch = max(
++            self.v12_rescue_start_epoch,
++            int(getattr(args, 'v12_rescue_end_epoch', 10)),
++        )
++        self.v12_rescue_topk = max(
++            1, int(getattr(args, 'v12_rescue_topk', 2))
++        )
++        self.v12_rescue_min_class_prob = self._clip01(
++            getattr(args, 'v12_rescue_min_class_prob', 0.20)
++        )
++        self.v12_rescue_min_competitor_ratio = max(
++            0.0,
++            float(getattr(args, 'v12_rescue_min_competitor_ratio', 0.50)),
++        )
++        self.v12_rescue_max_normal_prob = self._clip01(
++            getattr(args, 'v12_rescue_max_normal_prob', 0.20)
++        )
++        self.v12_rescue_proto_margin = max(
++            0.0, float(getattr(args, 'v12_rescue_proto_margin', 0.08))
++        )
++        self.v12_rescue_normal_proto_margin = max(
++            0.0,
++            float(getattr(args, 'v12_rescue_normal_proto_margin', 0.10)),
++        )
++        self.v12_rescue_min_similarity = min(
++            max(float(getattr(args, 'v12_rescue_min_similarity', 0.45)), -1.0),
++            1.0,
++        )
++        self.v12_rescue_radius_cap = max(
++            0.0, float(getattr(args, 'v12_rescue_radius_cap', 0.05))
++        )
++        self.v12_rescue_max_per_batch = max(
++            1, int(getattr(args, 'v12_rescue_max_per_batch', 4))
++        )
++        self.v12_rescue_min_target = max(
++            1, int(getattr(args, 'v12_rescue_min_target', 2))
++        )
++        self.v12_rescue_mix_alpha = min(
++            max(float(getattr(args, 'v12_rescue_mix_alpha', 0.25)), 0.0),
++            1.0,
++        )
++        self.v12_rescue_clmmd_boost = max(
++            0.0, float(getattr(args, 'v12_rescue_clmmd_boost', 1.10))
++        )
++        self.v12_rescue_score_tau = max(
++            1e-4, float(getattr(args, 'v12_rescue_score_tau', 0.10))
++        )
++
++        # Evaluation-time rewriting was ineffective in V11 and made training
++        # and inference inconsistent.  It remains optional, but is off by
++        # default and the dedicated runner keeps it disabled.
++        self.v12_eval_rescue_enabled = bool(
++            getattr(args, 'v12_eval_rescue_enabled', False)
++        )
++        self.v12_eval_min_class_prob = self._clip01(
++            getattr(args, 'v12_eval_min_class_prob', 0.20)
++        )
++        self.v12_eval_competitor_ratio = max(
++            0.0, float(getattr(args, 'v12_eval_competitor_ratio', 0.60))
++        )
++        self.v12_eval_min_source_votes = max(
++            1, int(getattr(args, 'v12_eval_min_source_votes', 2))
++        )
++        self.v12_eval_boost = max(
++            1.0, float(getattr(args, 'v12_eval_boost', 1.25))
++        )
++
++        self._reset_v12_epoch_stats()
++        self._v12_eval_total = 0
++        self._v12_eval_candidates = 0
++        self._v12_eval_changed = 0
++
++        logging.info(
++            'Using model: MFSAN_CDAN_BIMAMBA_CW_RWCA_V12_CWRU1_STABLE_RESCUE'
++        )
++        logging.info(
++            'V12 stable rescue: enabled={} class={} normal={} confusion={} '
++            'sources={} epoch=[{},{}] topk={} min_prob={:.3f} ratio={:.3f} '
++            'max_normal_prob={:.3f} proto_margin={:.3f} '
++            'normal_proto_margin={:.3f} min_similarity={:.3f} '
++            'radius_cap={:.3f} max_per_batch={} min_target={} mix_alpha={:.3f} '
++            'clmmd_boost={:.3f}'.format(
++                self.v12_rescue_enabled,
++                self.v12_rescue_class,
++                self.v12_normal_class,
++                self.v12_confusion_classes,
++                self.v12_rescue_source_indices,
++                self.v12_rescue_start_epoch,
++                self.v12_rescue_end_epoch,
++                self.v12_rescue_topk,
++                self.v12_rescue_min_class_prob,
++                self.v12_rescue_min_competitor_ratio,
++                self.v12_rescue_max_normal_prob,
++                self.v12_rescue_proto_margin,
++                self.v12_rescue_normal_proto_margin,
++                self.v12_rescue_min_similarity,
++                self.v12_rescue_radius_cap,
++                self.v12_rescue_max_per_batch,
++                self.v12_rescue_min_target,
++                self.v12_rescue_mix_alpha,
++                self.v12_rescue_clmmd_boost,
++            )
++        )
++        logging.info(
++            'V12 eval rescue: enabled={} min_prob={:.3f} ratio={:.3f} '
++            'min_votes={} boost={:.3f}'.format(
++                self.v12_eval_rescue_enabled,
++                self.v12_eval_min_class_prob,
++                self.v12_eval_competitor_ratio,
++                self.v12_eval_min_source_votes,
++                self.v12_eval_boost,
++            )
++        )
++        logging.info(
++            'V12 network structure unchanged; objective remains CE + MMD + CDAN + CLMMD + SupCon.'
++        )
++
++    @staticmethod
++    def _clip01(value) -> float:
++        return min(max(float(value), 0.0), 1.0)
++
++    def _parse_class_list(self, value, excluded=None) -> List[int]:
++        excluded = set(excluded or set())
++        result: List[int] = []
++        for item in str(value or '').split(','):
++            item = item.strip()
++            if not item:
++                continue
++            try:
++                class_idx = int(item)
++            except ValueError:
++                logging.warning('Ignore invalid V12 class id: %s', item)
++                continue
++            if (
++                0 <= class_idx < self.num_classes
++                and class_idx != self.v12_rescue_class
++                and class_idx not in excluded
++            ):
++                result.append(class_idx)
++        return sorted(set(result))
++
++    def _parse_source_list(self, value) -> List[int]:
++        result: List[int] = []
++        for item in str(value or '').split(','):
++            item = item.strip()
++            if not item:
++                continue
++            try:
++                source_idx = int(item)
++            except ValueError:
++                logging.warning('Ignore invalid V12 source id: %s', item)
++                continue
++            if 0 <= source_idx < self.num_source:
++                result.append(source_idx)
++        return sorted(set(result))
++
++    def _reset_v12_epoch_stats(self):
++        shape = int(getattr(self, 'num_source', 1))
++        device = getattr(self, 'device', torch.device('cpu'))
++        self._v12_candidates = torch.zeros(shape, dtype=torch.long, device=device)
++        self._v12_reject_normal_prob = torch.zeros(
++            shape, dtype=torch.long, device=device
++        )
++        self._v12_reject_proto = torch.zeros(shape, dtype=torch.long, device=device)
++        self._v12_pre_cap_accepted = torch.zeros(
++            shape, dtype=torch.long, device=device
++        )
++        self._v12_final_accepted = torch.zeros(
++            shape, dtype=torch.long, device=device
++        )
++        self._v12_valid_batches = torch.zeros(
++            shape, dtype=torch.long, device=device
++        )
++
++    def _checkpoint_dict(self):
++        checkpoint = super(Trainer, self)._checkpoint_dict()
++        checkpoint.update({
++            'v12_cwru1_stable_rescue': True,
++            'v12_rescue_class': int(self.v12_rescue_class),
++            'v12_normal_class': int(self.v12_normal_class),
++            'v12_rescue_source_indices': list(self.v12_rescue_source_indices),
++        })
++        return checkpoint
++
++    def _classwise_lmmd_per_class(self, f_s, f_t, labels_s, probs_t):
++        # Keep all original V10 CLMMD behavior as the baseline.  Stable rescue
++        # is only a small, filtered addition to the existing class-2 term.
++        loss_vec, valid_vec = super(Trainer, self)._classwise_lmmd_per_class(
++            f_s, f_t, labels_s, probs_t
++        )
++
++        epoch = int(getattr(self, '_cur_epoch', 1))
++        class_idx = int(self.v12_rescue_class)
++        normal_idx = int(self.v12_normal_class)
++        source_idx = int(getattr(self, '_active_source_idx_for_clmmd', -1))
++
++        if (
++            not self.v12_rescue_enabled
++            or epoch < self.v12_rescue_start_epoch
++            or epoch > self.v12_rescue_end_epoch
++            or source_idx not in self.v12_rescue_source_indices
++            or not (0 <= class_idx < self.num_classes)
++            or not (0 <= normal_idx < self.num_classes)
++            or self._v8_source_class_prototypes is None
++        ):
++            return loss_vec, valid_vec
++
++        proto_updates = self._v8_source_class_prototype_updates[source_idx]
++        radius_updates = self._v9_radius_updates[source_idx]
++        proto_valid = (
++            proto_updates >= self.v8_prototype_min_updates
++        ) & (
++            radius_updates >= self.v8_prototype_min_updates
++        )
++        if not bool(proto_valid[class_idx].item()):
++            return loss_vec, valid_vec
++        if not bool(proto_valid[normal_idx].item()):
++            return loss_vec, valid_vec
++        if int(proto_valid.sum().item()) < 3:
++            return loss_vec, valid_vec
++
++        source_mask = labels_s == class_idx
++        num_source_class = int(source_mask.sum().item())
++        if num_source_class < self.clmmd_min_source:
++            return loss_vec, valid_vec
++
++        probs_t = torch.clamp(probs_t, min=self.entropy_eps, max=1.0)
++        probs_t = probs_t / (
++            probs_t.sum(dim=1, keepdim=True) + self.entropy_eps
++        )
++        pseudo_label = probs_t.argmax(dim=1)
++        topk = min(self.v12_rescue_topk, self.num_classes)
++        topk_label = probs_t.topk(k=topk, dim=1).indices
++        class_in_topk = (topk_label == class_idx).any(dim=1)
++
++        confusion_pred = pseudo_label == class_idx
++        competitor_prob = torch.zeros_like(probs_t[:, class_idx])
++        for competitor in self.v12_confusion_classes:
++            confusion_pred = confusion_pred | (pseudo_label == competitor)
++            competitor_prob = torch.maximum(
++                competitor_prob, probs_t[:, competitor]
++            )
++
++        probability_candidate = (
++            class_in_topk
++            & confusion_pred
++            & (probs_t[:, class_idx] >= self.v12_rescue_min_class_prob)
++            & (
++                probs_t[:, class_idx]
++                >= self.v12_rescue_min_competitor_ratio * competitor_prob
++            )
++        )
++        candidate_count = int(probability_candidate.sum().item())
++        self._v12_candidates[source_idx] += candidate_count
++        if candidate_count == 0:
++            return loss_vec, valid_vec
++
++        normal_prob_ok = probs_t[:, normal_idx] <= self.v12_rescue_max_normal_prob
++        self._v12_reject_normal_prob[source_idx] += int(
++            (probability_candidate & ~normal_prob_ok).sum().item()
++        )
++
++        target_norm = F.normalize(f_t, p=2, dim=1)
++        prototypes = F.normalize(
++            self._v8_source_class_prototypes[source_idx], p=2, dim=1
++        )
++        similarity = torch.matmul(target_norm, prototypes.t())
++        similarity[:, ~proto_valid] = -1e9
++
++        top2_sim, top2_cls = similarity.topk(k=2, dim=1)
++        proto_label = top2_cls[:, 0]
++        proto_margin = top2_sim[:, 0] - top2_sim[:, 1]
++        class_similarity = similarity[:, class_idx]
++        normal_similarity = similarity[:, normal_idx]
++        normal_proto_gap = class_similarity - normal_similarity
++        proto_distance = (1.0 - class_similarity).clamp_min(0.0)
++
++        source_radius = self._v9_radius_threshold(source_idx, class_idx)
++        radius_cap = torch.as_tensor(
++            self.v12_rescue_radius_cap,
++            device=source_radius.device,
++            dtype=source_radius.dtype,
++        )
++        accepted_radius = torch.minimum(source_radius, radius_cap)
++
++        prototype_ok = (
++            (proto_label == class_idx)
++            & (proto_margin >= self.v12_rescue_proto_margin)
++            & (class_similarity >= self.v12_rescue_min_similarity)
++            & (normal_proto_gap >= self.v12_rescue_normal_proto_margin)
++            & (proto_distance <= accepted_radius)
++        )
++        preliminary = probability_candidate & normal_prob_ok & prototype_ok
++        self._v12_reject_proto[source_idx] += int(
++            (probability_candidate & normal_prob_ok & ~prototype_ok).sum().item()
++        )
++        pre_cap_count = int(preliminary.sum().item())
++        self._v12_pre_cap_accepted[source_idx] += pre_cap_count
++        if pre_cap_count < self.v12_rescue_min_target:
++            return loss_vec, valid_vec
++
++        # Quality score.  Only the strongest few samples from each batch are
++        # permitted to alter the existing class-wise alignment.
++        quality_score = (
++            probs_t[:, class_idx]
++            * torch.sigmoid(normal_proto_gap / self.v12_rescue_score_tau)
++            * torch.exp(-proto_distance / self.v12_rescue_score_tau)
++        )
++        preliminary_idx = preliminary.nonzero(as_tuple=False).flatten()
++        keep_count = min(
++            int(preliminary_idx.numel()), self.v12_rescue_max_per_batch
++        )
++        if keep_count < self.v12_rescue_min_target:
++            return loss_vec, valid_vec
++
++        selected_local = quality_score[preliminary_idx].topk(
++            k=keep_count, largest=True
++        ).indices
++        selected_idx = preliminary_idx[selected_local]
++        accepted = torch.zeros_like(preliminary)
++        accepted[selected_idx] = True
++        accepted_count = int(accepted.sum().item())
++        self._v12_final_accepted[source_idx] += accepted_count
++
++        distance_soft = torch.exp(
++            -proto_distance[accepted] / self.v9_prototype_soft_tau
++        ).clamp_min(1e-4)
++        target_weight_raw = probs_t[accepted, class_idx] * distance_soft
++        target_weight_sum = target_weight_raw.sum()
++        if target_weight_sum.detach().item() < self.clmmd_min_target_weight:
++            return loss_vec, valid_vec
++
++        source_features = f_s[source_mask]
++        target_features = f_t[accepted]
++        kernel_ss, kernel_st, kernel_tt = self._gaussian_kernel_matrix(
++            source_features, target_features
++        )
++        source_weight = torch.ones(
++            num_source_class, device=f_s.device
++        ) / float(num_source_class)
++        target_weight = target_weight_raw / (
++            target_weight_sum + self.entropy_eps
++        )
++        rescue_loss = (
++            torch.sum(
++                source_weight.view(-1, 1)
++                * source_weight.view(1, -1)
++                * kernel_ss
++            )
++            + torch.sum(
++                target_weight.view(-1, 1)
++                * target_weight.view(1, -1)
++                * kernel_tt
++            )
++            - 2.0
++            * torch.sum(
++                source_weight.view(-1, 1)
++                * target_weight.view(1, -1)
++                * kernel_st
++            )
++        )
++        rescue_loss = rescue_loss * self.v12_rescue_clmmd_boost
++
++        if bool(valid_vec[class_idx].detach().item() > 0):
++            loss_vec[class_idx] = (
++                (1.0 - self.v12_rescue_mix_alpha) * loss_vec[class_idx]
++                + self.v12_rescue_mix_alpha * rescue_loss
++            )
++        else:
++            # When no ordinary high-confidence class-2 pseudo labels exist,
++            # still keep the rescue contribution conservative.
++            loss_vec[class_idx] = (
++                self.v12_rescue_mix_alpha * rescue_loss
++            )
++        valid_vec[class_idx] = 1.0
++        self._v12_valid_batches[source_idx] += 1
++        return loss_vec, valid_vec
++
++    def _eval_class_weighted_fusion(self, probs_list):
++        fused_prob, weights = super(Trainer, self)._eval_class_weighted_fusion(
++            probs_list
++        )
++        if not self.v12_eval_rescue_enabled:
++            return fused_prob, weights
++
++        class_idx = int(self.v12_rescue_class)
++        if not (0 <= class_idx < self.num_classes):
++            return fused_prob, weights
++
++        probs_stack = torch.stack(probs_list, dim=0)
++        topk = min(self.v12_rescue_topk, self.num_classes)
++        branch_topk = probs_stack.topk(k=topk, dim=2).indices
++        source_votes = (branch_topk == class_idx).any(dim=2).sum(dim=0)
++
++        original_pred = fused_prob.argmax(dim=1)
++        confusion_pred = original_pred == class_idx
++        competitor_prob = torch.zeros_like(fused_prob[:, class_idx])
++        for competitor in self.v12_confusion_classes:
++            confusion_pred = confusion_pred | (original_pred == competitor)
++            competitor_prob = torch.maximum(
++                competitor_prob, fused_prob[:, competitor]
++            )
++
++        candidate = (
++            confusion_pred
++            & (source_votes >= self.v12_eval_min_source_votes)
++            & (fused_prob[:, class_idx] >= self.v12_eval_min_class_prob)
++            & (
++                fused_prob[:, class_idx]
++                >= self.v12_eval_competitor_ratio * competitor_prob
++            )
++        )
++        self._v12_eval_total += int(fused_prob.size(0))
++        self._v12_eval_candidates += int(candidate.sum().item())
++        if not bool(candidate.any().item()):
++            return fused_prob, weights
++
++        calibrated = fused_prob.clone()
++        calibrated[candidate, class_idx] *= self.v12_eval_boost
++        calibrated[candidate] = calibrated[candidate] / (
++            calibrated[candidate].sum(dim=1, keepdim=True) + self.entropy_eps
++        )
++        new_pred = calibrated.argmax(dim=1)
++        self._v12_eval_changed += int(
++            (candidate & (new_pred != original_pred)).sum().item()
++        )
++        return calibrated, weights
++
++    def test(self):
++        self._v12_eval_total = 0
++        self._v12_eval_candidates = 0
++        self._v12_eval_changed = 0
++        accuracy = super(Trainer, self).test()
++        logging.info(
++            'V12 eval rescue diagnostics: enabled={} candidates={}/{} '
++            '({:.2f}%) changed={}/{} ({:.2f}%) class={}'.format(
++                self.v12_eval_rescue_enabled,
++                self._v12_eval_candidates,
++                self._v12_eval_total,
++                100.0 * self._v12_eval_candidates / max(self._v12_eval_total, 1),
++                self._v12_eval_changed,
++                self._v12_eval_total,
++                100.0 * self._v12_eval_changed / max(self._v12_eval_total, 1),
++                self.v12_rescue_class,
++            )
++        )
++        return accuracy
++
++    def _finalize_v3_epoch_weights(self):
++        candidates = self._v12_candidates.detach().cpu().tolist()
++        reject_normal = self._v12_reject_normal_prob.detach().cpu().tolist()
++        reject_proto = self._v12_reject_proto.detach().cpu().tolist()
++        pre_cap = self._v12_pre_cap_accepted.detach().cpu().tolist()
++        final_accepted = self._v12_final_accepted.detach().cpu().tolist()
++        valid_batches = self._v12_valid_batches.detach().cpu().tolist()
++
++        super(Trainer, self)._finalize_v3_epoch_weights()
++        logging.info(
++            'V12 stable rescue epoch stats class-{}: {}'.format(
++                self.v12_rescue_class,
++                ' | '.join(
++                    (
++                        'src{} candidates={} reject_normal={} reject_proto={} '
++                        'pre_cap={} accepted={} valid_batches={}'
++                    ).format(
++                        source_idx,
++                        candidates[source_idx],
++                        reject_normal[source_idx],
++                        reject_proto[source_idx],
++                        pre_cap[source_idx],
++                        final_accepted[source_idx],
++                        valid_batches[source_idx],
++                    )
++                    for source_idx in range(self.num_source)
++                ),
++            )
++        )
++        self._reset_v12_epoch_stats()
++
++
++__all__ = ['Trainer']
+--- /dev/null	2026-08-06 08:21:07.070397883 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_stable_fix_complete/run_cwru1_stable_fix.py	2026-08-06 09:53:41.965823504 +0000
+@@ -0,0 +1,202 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Run the conservative CWRU_0+CWRU_2+CWRU_3 -> CWRU_1 experiment.
++
++The neural-network architecture is unchanged.  This script only changes the
++training schedule, source-weight floors, pseudo-label filtering, and checkpoint
++selection parameters.
++"""
++
++import argparse
++import subprocess
++import sys
++from pathlib import Path
++
++
++def build_command(args, seed):
++    train_py = Path(__file__).resolve().parent / 'train.py'
++    return [
++        sys.executable, str(train_py),
++        '--model_name', 'MFSAN_CDAN_BIMAMBA_CW_RWCA_V12_CWRU1_STABLE_RESCUE',
++        '--dataset_profile', 'cwru',
++        '--cwru_apply_general_defaults', 'False',
++        '--source', 'CWRU_0,CWRU_2,CWRU_3',
++        '--target', 'CWRU_1',
++        '--train_mode', 'multi_source',
++        '--data_dir', str(Path(args.data_dir).expanduser()),
++        '--include_faults',
++        'ball_07,ball_14,ball_21,inner_07,inner_14,inner_21,normal,outer_07,outer_14,outer_21',
++        '--signal_size', str(args.signal_size),
++        '--backbone', 'CNN',
++        '--cuda_device', args.cuda_device,
++        '--max_epoch', str(args.max_epoch),
++        '--batch_size', str(args.batch_size),
++        '--num_workers', str(args.num_workers),
++        '--random_state', str(seed),
++        '--target_test_size', str(args.target_test_size),
++        '--target_split_mode', 'time',
++        '--source_balance_data', 'True',
++
++        # Same five losses, with a weaker adaptation schedule to reduce late
++        # negative transfer and normal-class collapse.
++        '--lambda_l1', '0.0',
++        '--lambda_cda', '0.0',
++        '--lambda_ent', '0.0',
++        '--lambda_mca', '0.0',
++        '--lambda_adv', str(args.lambda_adv),
++        '--lambda_clmmd', str(args.lambda_clmmd),
++        '--lambda_supcon', str(args.lambda_supcon),
++        '--supcon_temperature', '0.20',
++        '--supcon_start_epoch', str(args.supcon_start_epoch),
++        '--supcon_feature_mode', 'G',
++        '--supcon_focus_classes', '0,1,2',
++        '--pl_conf_thresh', '0.85',
++        '--pl_min_target', '2',
++        '--rec_score_weight', '0.30',
++
++        # Keep a small contribution from every source.  The former run reduced
++        # CWRU_0 to about 0.1%, effectively turning three-source adaptation into
++        # two-source adaptation.
++        '--v6_gate_enabled', 'True',
++        '--v6_gate_start_epoch', '4',
++        '--v6_gate_confirm_epochs', '3',
++        '--v6_gate_bottom_floor', str(args.source_floor),
++        '--v6_gate_preconfirm_floor', str(args.source_floor),
++        '--v6_gate_max_source_weight', '0.70',
++
++        # Delay class-wise irreversible decisions until a stable target
++        # boundary exists.
++        '--v7_class_gate_enabled', 'True',
++        '--v7_class_gate_start_epoch', '8',
++        '--v7_class_gate_confirm_epochs', '4',
++        '--v7_class_gate_bottom_floor', str(args.class_floor),
++        '--v7_class_gate_preconfirm_floor', str(args.class_floor),
++        '--v7_class_gate_log_classes', '0,1,2,6',
++        '--v7_conflict_fusion_enabled', 'True',
++        '--v9_specialist_protection_enabled', 'True',
++        '--v9_specialist_start_epoch', '8',
++
++        # Mild, delayed separation for the three ball-fault severities.
++        '--v8_hard_supcon_enabled', 'True',
++        '--v8_hard_negative_pairs', '0-2,1-2',
++        '--v8_hard_negative_weight', '1.10',
++        '--v8_supcon_anchor_classes', '0,1,2',
++        '--v9_hard_supcon_start_epoch', str(args.rescue_start_epoch),
++        '--v9_hard_supcon_ramp_epochs', '4',
++        '--v10_hard_pair_weights', '0-2:1.05,1-2:1.10',
++
++        # Retain the original prototype mechanism, but avoid the former 1.5x
++        # class-2 over-alignment.
++        '--v8_prototype_filter_enabled', 'True',
++        '--v8_prototype_start_epoch', '4',
++        '--v8_prototype_ema_momentum', '0.95',
++        '--v8_prototype_margin', '0.05',
++        '--v8_prototype_min_updates', '2',
++        '--v8_prototype_conf_overrides', '0:0.90,1:0.90,2:0.80',
++        '--v8_clmmd_class_boost', '2:1.10',
++        '--v8_prototype_log_classes', '0,1,2,6',
++        '--v9_prototype_filter_classes', '0,1,2',
++        '--v9_radius_min', '0.02',
++        '--v9_radius_max', '0.10',
++        '--v9_prototype_min_similarity', '0.40',
++        '--v9_prototype_soft_tau', '0.10',
++        '--v10_radius_class_min', '2:0.02',
++        '--v10_radius_class_max', '2:0.06',
++
++        # Normal-class guard must use the CWRU normal index 6.
++        '--v10_normal_guard_enabled', 'True',
++        '--v10_normal_class', '6',
++        '--v10_normal_min_prob', '0.80',
++        '--v10_normal_guard_min_fault_prob', '0.05',
++
++        # V12 stable rescue: one specialist branch, strict normal exclusion,
++        # strict prototype agreement, and at most a few samples per batch.
++        '--v12_rescue_enabled', 'True',
++        '--v12_rescue_class', '2',
++        '--v12_normal_class', '6',
++        '--v12_confusion_classes', '0,1',
++        '--v12_rescue_source_indices', args.rescue_source_indices,
++        '--v12_rescue_start_epoch', str(args.rescue_start_epoch),
++        '--v12_rescue_end_epoch', str(args.rescue_end_epoch),
++        '--v12_rescue_topk', '2',
++        '--v12_rescue_min_class_prob', str(args.rescue_min_prob),
++        '--v12_rescue_min_competitor_ratio', str(args.rescue_min_ratio),
++        '--v12_rescue_max_normal_prob', str(args.rescue_max_normal_prob),
++        '--v12_rescue_proto_margin', str(args.rescue_proto_margin),
++        '--v12_rescue_normal_proto_margin', str(args.rescue_normal_proto_margin),
++        '--v12_rescue_min_similarity', str(args.rescue_min_similarity),
++        '--v12_rescue_radius_cap', str(args.rescue_radius_cap),
++        '--v12_rescue_max_per_batch', str(args.rescue_max_per_batch),
++        '--v12_rescue_min_target', '2',
++        '--v12_rescue_mix_alpha', str(args.rescue_mix_alpha),
++        '--v12_rescue_clmmd_boost', str(args.rescue_clmmd_boost),
++        '--v12_rescue_score_tau', '0.10',
++        '--v12_eval_rescue_enabled', str(args.eval_rescue),
++
++        # Keep the requested PU-style target-test checkpoint selection.  The
++        # class-aware score prevents a high overall accuracy from hiding a
++        # completely collapsed ball_21 class.
++        '--eval_each_epoch', str(args.eval_each_epoch),
++        '--select_best_on_target', str(args.select_best_on_target),
++        '--save_best', str(args.select_best_on_target),
++        '--best_metric', args.best_metric,
++        '--best_focus_class', '2',
++        '--best_accuracy_weight', '0.40',
++        '--best_macro_f1_weight', '0.35',
++        '--best_focus_recall_weight', '0.25',
++        '--save_dir', args.save_dir,
++    ]
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--data_dir', required=True)
++    parser.add_argument('--seeds', default='2027')
++    parser.add_argument('--cuda_device', default='0')
++    parser.add_argument('--max_epoch', type=int, default=15)
++    parser.add_argument('--batch_size', type=int, default=64)
++    parser.add_argument('--num_workers', type=int, default=4)
++    parser.add_argument('--signal_size', type=int, default=1024)
++    parser.add_argument('--target_test_size', type=float, default=0.40)
++
++    parser.add_argument('--lambda_adv', type=float, default=0.008)
++    parser.add_argument('--lambda_clmmd', type=float, default=0.002)
++    parser.add_argument('--lambda_supcon', type=float, default=0.004)
++    parser.add_argument('--supcon_start_epoch', type=int, default=4)
++    parser.add_argument('--source_floor', type=float, default=0.03)
++    parser.add_argument('--class_floor', type=float, default=0.03)
++
++    parser.add_argument('--rescue_source_indices', default='2')
++    parser.add_argument('--rescue_start_epoch', type=int, default=6)
++    parser.add_argument('--rescue_end_epoch', type=int, default=10)
++    parser.add_argument('--rescue_min_prob', type=float, default=0.20)
++    parser.add_argument('--rescue_min_ratio', type=float, default=0.50)
++    parser.add_argument('--rescue_max_normal_prob', type=float, default=0.20)
++    parser.add_argument('--rescue_proto_margin', type=float, default=0.08)
++    parser.add_argument('--rescue_normal_proto_margin', type=float, default=0.10)
++    parser.add_argument('--rescue_min_similarity', type=float, default=0.45)
++    parser.add_argument('--rescue_radius_cap', type=float, default=0.05)
++    parser.add_argument('--rescue_max_per_batch', type=int, default=4)
++    parser.add_argument('--rescue_mix_alpha', type=float, default=0.25)
++    parser.add_argument('--rescue_clmmd_boost', type=float, default=1.10)
++    parser.add_argument('--eval_rescue', choices=['True', 'False'], default='False')
++
++    parser.add_argument('--eval_each_epoch', choices=['True', 'False'], default='True')
++    parser.add_argument('--select_best_on_target', choices=['True', 'False'], default='True')
++    parser.add_argument(
++        '--best_metric',
++        choices=['accuracy', 'macro_f1', 'class_aware'],
++        default='class_aware',
++    )
++    parser.add_argument('--save_dir', default='./ckpt/CWRU1_V12_STABLE_FIX')
++    args = parser.parse_args()
++
++    seeds = [int(item) for item in args.seeds.split(',') if item.strip()]
++    for seed in seeds:
++        command = build_command(args, seed)
++        print('\nRUN:', ' '.join(command), flush=True)
++        subprocess.run(command, check=True)
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null	2026-08-06 08:21:07.070397883 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU1_stable_fix_complete/README_CWRU1_STABLE_FIX.md	2026-08-06 09:54:04.426059617 +0000
+@@ -0,0 +1,116 @@
++# CWRU_1 V12 稳定修复版
++
++## 1. 修改目标
++
++目标任务固定为：
++
++```text
++CWRU_0 + CWRU_2 + CWRU_3 -> CWRU_1
++```
++
++V11 日志显示：训练后期每轮接受数百次 `ball_21` 救援样本，但测试阶段
++`ball_21` 仍只有很低的召回率，同时 `normal` 召回率明显下降。因此，V12
++不再扩大救援数量，而是仅使用少量、高质量、排除正常类的目标候选。
++
++## 2. 网络结构没有变化
++
++V12 沿用原 V10 的全部网络模块：
++
++- MSCNN-BiMamba 特征主干；
++- 三个源域专用特征头；
++- 三个分类器；
++- CDAN 域判别器；
++- 原有多源融合结构。
++
++未新增、删除或调整任何卷积层、BiMamba 层、分类器层、域判别层及其维度。
++仍然使用五项原有目标：CE、MMD、CDAN、CLMMD 和 SupCon。
++
++## 3. 训练策略修改
++
++1. `ball_21` 救援从第 6 轮开始，第 10 轮结束。
++2. 默认只允许 CWRU_3 分支（源分支 2）提供救援 CLMMD。
++3. `ball_21` 概率至少为 0.20，且不低于竞争类别概率的 50%。
++4. `normal` 概率必须不高于 0.20。
++5. `ball_21` 原型必须是最近原型，且：
++   - 原型 Top1-Top2 余量不低于 0.08；
++   - 与 `ball_21` 原型余弦相似度不低于 0.45；
++   - 相对 `normal` 原型的相似度优势不低于 0.10；
++   - 距离不超过 0.05。
++6. 每个小批次最多保留 4 个质量最高的救援样本。
++7. 救援 CLMMD 只以 25% 比例混入原 CLMMD，不再直接覆盖。
++8. `ball_21` CLMMD 增强由 1.50 降为 1.10。
++9. 测试阶段概率救援默认关闭，保持训练与推理结果可解释。
++10. 域对抗、CLMMD、SupCon 权重降低并延迟启动，减少后期负迁移。
++11. 源域与类别权重下限改为 0.03，避免三源模型退化成双源模型。
++
++## 4. 数据检查
++
++```bash
++python check_cwru_dataset.py \
++  --data_dir "/workspace/CWRU_TL/CWRU" \
++  --signal_size 1024
++```
++
++```bash
++python diagnose_cwru1_data.py \
++  --data_dir "/workspace/CWRU_TL/CWRU" \
++  --signal_size 1024 \
++  --output cwru1_ball21_audit.csv
++```
++
++## 5. 推荐运行命令
++
++```bash
++python run_cwru1_stable_fix.py \
++  --data_dir "/workspace/CWRU_TL/CWRU" \
++  --seeds 2027 \
++  --cuda_device 0 \
++  --max_epoch 15 \
++  --batch_size 64 \
++  --num_workers 4 \
++  --signal_size 1024 \
++  --target_test_size 0.40 \
++  --eval_each_epoch True \
++  --select_best_on_target True \
++  --best_metric class_aware
++```
++
++后台运行：
++
++```bash
++nohup python -u run_cwru1_stable_fix.py \
++  --data_dir "/workspace/CWRU_TL/CWRU" \
++  --seeds 2027 \
++  --cuda_device 0 \
++  --max_epoch 15 \
++  --batch_size 64 \
++  --num_workers 4 \
++  --signal_size 1024 \
++  --target_test_size 0.40 \
++  --eval_each_epoch True \
++  --select_best_on_target True \
++  --best_metric class_aware \
++  > cwru1_v12_stable_seed2027.log 2>&1 &
++```
++
++## 6. 日志中重点检查
++
++```text
++V12 stable rescue epoch stats class-2
++Target-Test-Class-2
++Target-Test-Class-6
++Target-Test-F1-macro
++Best model updated
++```
++
++理想状态：
++
++- `accepted` 每个源分支每轮保持在较低数量，不再达到数百；
++- class 2 的 Recall 和 F1 提高；
++- class 6 的 Recall 不出现大幅下降；
++- Macro-F1 与 Accuracy 同时保持或提高。
++
++## 7. 最佳模型
++
++使用文件名带 `_best.pth` 的模型。最终第 15 轮模型只用于记录，不应替代
++根据目标测试指标保存的最佳检查点。

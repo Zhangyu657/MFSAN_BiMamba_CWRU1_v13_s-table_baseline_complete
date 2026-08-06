@@ -1,0 +1,1002 @@
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/utils.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/utils.py	2026-08-06 04:22:26.967679719 +0000
+@@ -1,3 +1,4 @@
++import os
+ import torch
+ import numpy as np
+ from torch import nn
+@@ -15,6 +16,23 @@
+         return H
+         
+ 
++def resolve_dataset_root(data_dir, dataset):
++    """Resolve either ``data_dir/dataset`` or a directly supplied dataset dir.
++
++    Both of the following are accepted for CWRU::
++
++        --data_dir /workspace/CWRU_TL
++        --data_dir /workspace/CWRU_TL/CWRU
++    """
++    data_dir = os.path.abspath(os.path.expanduser(str(data_dir)))
++    nested = os.path.join(data_dir, dataset)
++    if os.path.isdir(nested):
++        return nested
++    if os.path.basename(os.path.normpath(data_dir)).lower() == dataset.lower():
++        return data_dir
++    return nested
++
++
+ def get_info_from_name(name):
+     dataset = name
+     condition = None
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/opt.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/opt.py	2026-08-06 04:22:26.968126362 +0000
+@@ -37,6 +37,17 @@
+     parser.add_argument('--random_state', type=int, default=10,
+                         help='Random state for the entire training')
+ 
++    # dataset/profile parameters
++    parser.add_argument('--dataset_profile', type=str, default='auto',
++                        choices=['auto', 'generic', 'cwru'],
++                        help='Dataset-specific safe defaults. auto detects CWRU from source/target names.')
++    parser.add_argument('--cwru_apply_general_defaults', type=str2bool, default=True,
++                        help='For CWRU, remove PU-specific class-pair calibration and infer the normal class automatically.')
++    parser.add_argument('--source_balance_data', type=str2bool, default=False,
++                        help='Downsample each labeled source class to the same number of windows.')
++    parser.add_argument('--cwru_channel', type=str, default='DE', choices=['DE', 'FE', 'BA'],
++                        help='CWRU vibration channel selected from MATLAB variables.')
++
+     # target-domain split parameters
+     parser.add_argument('--target_test_size', type=float, default=0.40,
+                         help='Target-domain held-out test ratio. Default 0.40 means 60%% unlabeled target train and 40%% target test.')
+@@ -126,6 +137,11 @@
+     parser.add_argument('--save_best', type=str2bool, default=True,
+                         help='Save best checkpoint according to validation accuracy during training.')
+ 
++    parser.add_argument('--eval_each_epoch', type=str2bool, default=True,
++                        help='Evaluate the held-out target set after every epoch.')
++    parser.add_argument('--select_best_on_target', type=str2bool, default=True,
++                        help='Use held-out target accuracy to select a best checkpoint. Set False for strict UDA reporting.')
++
+     # BiMamba small-gate backbone parameters
+     parser.add_argument('--bimamba_stem_channels', type=int, default=64,
+                         help='Stem channels for BiMamba-Attention auxiliary branch.')
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/train.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/train.py	2026-08-06 04:22:26.968331377 +0000
+@@ -38,6 +38,7 @@
+ 
+ import utils
+ from opt import parse_args
++from cwru_profile import apply_before_class_discovery, apply_after_label_mapping
+ 
+ 
+ def setlogger(path):
+@@ -162,10 +163,10 @@
+ def get_fault(name, args):
+     dataset, condition, selected_list = utils.get_info_from_name(name)
+     if condition is not None:
+-        data_root = os.path.join(args.data_dir, dataset)
++        data_root = utils.resolve_dataset_root(args.data_dir, dataset)
+         faults = np.array(sorted(os.listdir(os.path.join(data_root, 'condition_%d' % condition))))
+     else:
+-        data_root = os.path.join(args.data_dir, dataset)
++        data_root = utils.resolve_dataset_root(args.data_dir, dataset)
+         faults = np.array(sorted(os.listdir(data_root)))
+     if selected_list:
+         faults = faults[selected_list]
+@@ -214,6 +215,9 @@
+     if '' in args.source_name:
+         args.source_name.remove('')
+ 
++    # Apply dataset-specific defaults before class folder discovery.
++    args = apply_before_class_discovery(args)
++
+     if not args.load_path:
+         if len(args.source_name) == 1:
+             args.train_mode = 'single_source'
+@@ -243,6 +247,8 @@
+     args.fault_label = {}
+     for i, fault in enumerate(sorted(all_faults)):
+         args.fault_label[fault] = i
++    # Semantic indices such as the CWRU normal class are only known now.
++    args = apply_after_label_mapping(args)
+     if args.train_mode == 'source_combine':
+         source_faults_flat = sorted(list(set([fault for sublist in args.faults[:-1] for fault in sublist])))
+         args.faults.insert(0, source_faults_flat)
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/train_utils.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/train_utils.py	2026-08-06 04:24:02.754379244 +0000
+@@ -75,7 +75,7 @@
+         tradeoff = []
+         for item in tradeoff_list:
+             if item == 'exp':
+-                tradeoff.append(2 / (1 + math.exp(-self.args.zeta * (epoch-1) / (self.args.max_epoch-1))) - 1)
++                tradeoff.append(2 / (1 + math.exp(-self.args.zeta * (epoch-1) / max(self.args.max_epoch-1, 1))) - 1)
+             elif type(item) == float or type(item) == int:
+                 tradeoff.append(item)
+             else:
+@@ -192,11 +192,17 @@
+             dataset, condition, _ = utils.get_info_from_name(source)
+             if condition is not None:
+                 Dataset = importlib.import_module("data_loader.conditional_load").dataset
+-                self.datasets[source] = Dataset(args, dataset, i+1 if args.train_mode == 'source_combine' else i,
+-                                                condition=condition).data_preprare(is_src=True)
++                self.datasets[source] = Dataset(
++                    args, dataset, i+1 if args.train_mode == 'source_combine' else i,
++                    condition=condition,
++                    balance_data=bool(getattr(args, 'source_balance_data', False)),
++                ).data_preprare(is_src=True)
+             else:
+                 Dataset = importlib.import_module("data_loader.load").dataset
+-                self.datasets[source] = Dataset(args, dataset, i+1 if args.train_mode == 'source_combine' else i).data_preprare(is_src=True) 
++                self.datasets[source] = Dataset(
++                    args, dataset, i+1 if args.train_mode == 'source_combine' else i,
++                    balance_data=bool(getattr(args, 'source_balance_data', False)),
++                ).data_preprare(is_src=True)
+         for key in self.datasets.keys():
+             logging.info('Source set {} number of samples: {}.'.format(key, len(self.datasets[key])))
+             self.datasets[key].summary()
+@@ -272,22 +278,41 @@
+             # Log epoch information
+             self._log_epoch_info(epoch_loss, epoch_acc, self.num_iter)
+             
+-            # Log and optionally save the best model according to target-test accuracy
+-            new_acc = self.test()
+-            if new_acc >= best_acc:
+-                best_acc = new_acc
+-                best_epoch = epoch
+-                if getattr(args, 'save', False) and getattr(args, 'save_best', True):
+-                    if hasattr(self, 'save_best_model'):
+-                        self.save_best_model()
+-                    else:
+-                        # Fallback for older models: save the current model as the normal checkpoint.
+-                        self.save_model()
+-                    logging.info("Best model updated at epoch {}, target-test-acc {:.4f}".format(best_epoch, best_acc))
+-            logging.info("The best model epoch {}, target-test-acc {:.4f}".format(best_epoch, best_acc))
+-            
++            # Target evaluation can be disabled during training for strict UDA.
++            if bool(getattr(args, 'eval_each_epoch', True)):
++                new_acc = self.test()
++                if bool(getattr(args, 'select_best_on_target', True)):
++                    if new_acc >= best_acc:
++                        best_acc = new_acc
++                        best_epoch = epoch
++                        if getattr(args, 'save', False) and getattr(args, 'save_best', True):
++                            if hasattr(self, 'save_best_model'):
++                                self.save_best_model()
++                            else:
++                                self.save_model()
++                            logging.info(
++                                "Best model updated at epoch {}, target-test-acc {:.4f}".format(
++                                    best_epoch, best_acc
++                                )
++                            )
++                    logging.info(
++                        "The best model epoch {}, target-test-acc {:.4f}".format(
++                            best_epoch, best_acc
++                        )
++                    )
++                else:
++                    logging.info(
++                        "Target test was reported but not used for checkpoint selection."
++                    )
++
+             if self.lr_scheduler is not None:
+                 self.lr_scheduler.step()
++
++        if not bool(getattr(args, 'eval_each_epoch', True)):
++            logging.info(
++                "Training finished; evaluating the held-out target set once (strict mode)."
++            )
++            self.test()
+             
+     def test(self):
+         self._set_to_eval()
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/data_loader/load_methods.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/data_loader/load_methods.py	2026-08-06 04:22:26.967558949 +0000
+@@ -1,61 +1,101 @@
+-import os
+-import numpy as np
+-import pandas as pd
+-from scipy.io import loadmat
+-
+-
+-def CWRU(item_path):
+-    axis = ["_DE_time", "_FE_time", "_BA_time"]
+-    datanumber = os.path.basename(item_path).split(".")[0]
+-    if eval(datanumber) < 100:
+-        realaxis = "X0" + datanumber + axis[0]
+-    else:
+-        realaxis = "X" + datanumber + axis[0]
+-    signal = loadmat(item_path)[realaxis]
+-
+-    return signal
+-
+-
+-def MFPT(item_path):
+-    f = item_path.split("/")[-2]
+-    if f == 'normal':
+-        signal = (loadmat(item_path)["bearing"][0][0][1])
+-    else:
+-        signal = (loadmat(item_path)["bearing"][0][0][2])
+-
+-    return signal
+-
+-
+-def PU(item_path):
+-    name = os.path.basename(item_path).split(".")[0]
+-    fl = loadmat(item_path)[name]
+-    signal = fl[0][0][2][0][6][2]  #Take out the data
+-    signal = signal.reshape(-1,1)
+-
+-    return signal
+-
+-
+-def XJTU(item_path):
+-    fl = pd.read_csv(item_path)
+-    signal = fl["Horizontal_vibration_signals"]
+-    signal = signal.values.reshape(-1,1)
+-
+-    return signal
+-
+-
+-def IMS(item_path):
+-    channel = {'normal': 0,
+-               'inner': 4,
+-               'outer': 0,
+-               'ball': 6}
+-    f = item_path.split("/")[-2]
+-    signal = np.loadtxt(item_path)[:, channel[f]]
+-
+-    return signal
+-
+-
+-def JNU(item_path):
+-    fl = pd.read_csv(item_path)
+-    signal = fl.values
+-    
+-    return signal
++import os
++import numpy as np
++import pandas as pd
++from scipy.io import loadmat
++
++
++def CWRU(item_path):
++    """Load one CWRU MATLAB vibration file robustly.
++
++    The original implementation inferred the MATLAB variable from a numeric
++    filename such as ``105.mat``.  That fails when files are renamed.  This
++    version inspects the variables in the file and selects a vibration channel
++    directly.  The channel can be changed with the environment variable
++    ``CWRU_CHANNEL`` (DE, FE or BA); DE is the default used by this project.
++
++    Returns
++    -------
++    numpy.ndarray
++        Float32 array with shape [signal_length, 1].
++    """
++    mat = loadmat(item_path)
++    channel = os.environ.get("CWRU_CHANNEL", "DE").strip().upper()
++    if channel not in {"DE", "FE", "BA"}:
++        raise ValueError(
++            f"Unsupported CWRU_CHANNEL={channel!r}; use DE, FE or BA."
++        )
++
++    suffix = f"_{channel}_time"
++    candidates = sorted(
++        key for key in mat.keys()
++        if not key.startswith("__") and key.endswith(suffix)
++    )
++
++    # Some redistributed files use slightly different capitalization.  Use a
++    # case-insensitive fallback while still requiring the requested channel.
++    if not candidates:
++        suffix_lower = suffix.lower()
++        candidates = sorted(
++            key for key in mat.keys()
++            if not key.startswith("__") and key.lower().endswith(suffix_lower)
++        )
++
++    if not candidates:
++        available = [key for key in mat.keys() if not key.startswith("__")]
++        raise KeyError(
++            f"No CWRU {channel}-end vibration variable (*{suffix}) found in "
++            f"{item_path}. Available variables: {available}"
++        )
++
++    signal_key = candidates[0]
++    signal = np.asarray(mat[signal_key], dtype=np.float32).reshape(-1, 1)
++    if signal.size == 0:
++        raise ValueError(f"Empty CWRU signal in {item_path}, key={signal_key}")
++    if not np.isfinite(signal).all():
++        raise ValueError(f"NaN/Inf found in CWRU signal {item_path}, key={signal_key}")
++    return signal
++
++
++def MFPT(item_path):
++    f = item_path.split("/")[-2]
++    if f == 'normal':
++        signal = (loadmat(item_path)["bearing"][0][0][1])
++    else:
++        signal = (loadmat(item_path)["bearing"][0][0][2])
++
++    return signal
++
++
++def PU(item_path):
++    name = os.path.basename(item_path).split(".")[0]
++    fl = loadmat(item_path)[name]
++    signal = fl[0][0][2][0][6][2]  #Take out the data
++    signal = signal.reshape(-1,1)
++
++    return signal
++
++
++def XJTU(item_path):
++    fl = pd.read_csv(item_path)
++    signal = fl["Horizontal_vibration_signals"]
++    signal = signal.values.reshape(-1,1)
++
++    return signal
++
++
++def IMS(item_path):
++    channel = {'normal': 0,
++               'inner': 4,
++               'outer': 0,
++               'ball': 6}
++    f = item_path.split("/")[-2]
++    signal = np.loadtxt(item_path)[:, channel[f]]
++
++    return signal
++
++
++def JNU(item_path):
++    fl = pd.read_csv(item_path)
++    signal = fl.values
++    
++    return signal
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/data_loader/load.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/data_loader/load.py	2026-08-06 04:22:26.967913646 +0000
+@@ -1,74 +1,75 @@
+-import os
+-import pandas as pd
+-
+-import aug
+-import data_utils
+-import load_methods
+-
+-
+-def get_files(root, dataset, faults, fault_label, signal_size):
+-    data, actual_labels = [], []
+-    data_load = getattr(load_methods, dataset)
+-    
+-    for _, name in enumerate(faults):
+-        data_dir = os.path.join(root, name)
+-
+-        for item in os.listdir(data_dir):
+-            item_path = os.path.join(data_dir, item)
+-            signal = data_load(item_path)
+-
+-            start, end = 0, signal_size
+-            while end <= signal.shape[0]:
+-                data.append(signal[start:end])
+-                actual_labels.append(fault_label[name])
+-                start += signal_size
+-                end += signal_size
+-
+-    return data, actual_labels
+-
+-
+-def data_transforms(normlize_type="-1-1"):
+-    transforms = {
+-        'train': aug.Compose([
+-            aug.Reshape(),
+-            aug.Normalize(normlize_type),
+-            aug.Retype()
+-
+-        ]),
+-        'val': aug.Compose([
+-            aug.Reshape(),
+-            aug.Normalize(normlize_type),
+-            aug.Retype()
+-        ])
+-    }
+-    return transforms
+-
+-
+-class dataset(object):
+-    
+-    def __init__(self, args, dataset, source_idx, balance_data=False, test_size=0.2):
+-        self.args = args
+-        data_root = os.path.join(args.data_dir, dataset)
+-        faults = args.faults[source_idx]
+-        signal_size = args.signal_size
+-        normlize_type = args.normlize_type
+-        fault_label = args.fault_label
+-        self.label_set = args.label_sets[source_idx]
+-        self.random_state = args.random_state
+-        self.balance_data = balance_data
+-        self.test_size = test_size
+-
+-        self.data, self.actual_labels = get_files(data_root, dataset, faults, fault_label, signal_size)
+-        self.transform = data_transforms(normlize_type)
+-
+-    def data_preprare(self, is_src=False):
+-        data_pd = pd.DataFrame({"data": self.data, "actual_labels": self.actual_labels})
+-        data_pd = data_utils.balance_data(data_pd) if self.balance_data else data_pd
+-        if is_src:
+-            train_dataset = data_utils.dataset(list_data=data_pd, transform=self.transform['train'])
+-            return train_dataset
+-        else:
+-            train_pd, val_pd = data_utils.train_test_split_(data_pd, test_size=self.test_size, label_set=self.label_set, random_state=self.random_state)
+-            train_dataset = data_utils.dataset(list_data=train_pd, transform=self.transform['train'])
+-            val_dataset = data_utils.dataset(list_data=val_pd, transform=self.transform['val'])
+-            return train_dataset, val_dataset
++import os
++import pandas as pd
++
++import aug
++import data_utils
++import load_methods
++import utils
++
++
++def get_files(root, dataset, faults, fault_label, signal_size):
++    data, actual_labels = [], []
++    data_load = getattr(load_methods, dataset)
++    
++    for _, name in enumerate(faults):
++        data_dir = os.path.join(root, name)
++
++        for item in os.listdir(data_dir):
++            item_path = os.path.join(data_dir, item)
++            signal = data_load(item_path)
++
++            start, end = 0, signal_size
++            while end <= signal.shape[0]:
++                data.append(signal[start:end])
++                actual_labels.append(fault_label[name])
++                start += signal_size
++                end += signal_size
++
++    return data, actual_labels
++
++
++def data_transforms(normlize_type="-1-1"):
++    transforms = {
++        'train': aug.Compose([
++            aug.Reshape(),
++            aug.Normalize(normlize_type),
++            aug.Retype()
++
++        ]),
++        'val': aug.Compose([
++            aug.Reshape(),
++            aug.Normalize(normlize_type),
++            aug.Retype()
++        ])
++    }
++    return transforms
++
++
++class dataset(object):
++    
++    def __init__(self, args, dataset, source_idx, balance_data=False, test_size=0.2):
++        self.args = args
++        data_root = utils.resolve_dataset_root(args.data_dir, dataset)
++        faults = args.faults[source_idx]
++        signal_size = args.signal_size
++        normlize_type = args.normlize_type
++        fault_label = args.fault_label
++        self.label_set = args.label_sets[source_idx]
++        self.random_state = args.random_state
++        self.balance_data = balance_data
++        self.test_size = test_size
++
++        self.data, self.actual_labels = get_files(data_root, dataset, faults, fault_label, signal_size)
++        self.transform = data_transforms(normlize_type)
++
++    def data_preprare(self, is_src=False):
++        data_pd = pd.DataFrame({"data": self.data, "actual_labels": self.actual_labels})
++        data_pd = data_utils.balance_data(data_pd) if self.balance_data else data_pd
++        if is_src:
++            train_dataset = data_utils.dataset(list_data=data_pd, transform=self.transform['train'])
++            return train_dataset
++        else:
++            train_pd, val_pd = data_utils.train_test_split_(data_pd, test_size=self.test_size, label_set=self.label_set, random_state=self.random_state)
++            train_dataset = data_utils.dataset(list_data=train_pd, transform=self.transform['train'])
++            val_dataset = data_utils.dataset(list_data=val_pd, transform=self.transform['val'])
++            return train_dataset, val_dataset
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/data_loader/conditional_load.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/data_loader/conditional_load.py	2026-08-06 04:22:26.967751946 +0000
+@@ -7,6 +7,7 @@
+ import aug
+ import data_utils
+ import load_methods
++import utils
+ 
+ 
+ def _iter_class_files(root, condition, class_name):
+@@ -50,6 +51,11 @@
+     for item_path in file_list:
+         signal = data_load(item_path)
+         windows = _window_signal(signal, signal_size)
++        if not windows:
++            raise ValueError(
++                f"Signal shorter than one window: file={item_path}, "
++                f"length={signal.shape[0]}, signal_size={signal_size}"
++            )
+         data.extend(windows)
+         actual_labels.extend([label] * len(windows))
+     return data, actual_labels
+@@ -185,6 +191,12 @@
+ 
+             train_windows = _window_signal(train_signal, signal_size)
+             test_windows = _window_signal(test_signal, signal_size)
++            if not train_windows or not test_windows:
++                raise ValueError(
++                    f"CWRU target time split produced an empty side for {item_path}: "
++                    f"length={n}, split={split_point}, signal_size={signal_size}. "
++                    "Reduce --signal_size or change --target_test_size."
++                )
+ 
+             train_data.extend(train_windows)
+             train_labels.extend([label] * len(train_windows))
+@@ -215,7 +227,7 @@
+ 
+     def __init__(self, args, dataset, source_idx, condition=2, balance_data=False, test_size=0.2):
+         self.args = args
+-        data_root = os.path.join(args.data_dir, dataset)
++        data_root = utils.resolve_dataset_root(args.data_dir, dataset)
+         faults = args.faults[source_idx]
+         signal_size = args.signal_size
+         normlize_type = args.normlize_type
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V2.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V2.py	2026-08-06 04:24:02.754712989 +0000
+@@ -726,21 +726,41 @@
+             epoch_acc, epoch_loss = self._train_one_epoch(epoch_acc, epoch_loss)
+             self._log_epoch_info(epoch_loss, epoch_acc, self.num_iter)
+ 
+-            new_acc = self.test()
+-            if new_acc >= best_acc:
+-                best_acc = new_acc
+-                best_epoch = epoch
+-                if getattr(args, 'save', False) and getattr(args, 'save_best', True):
+-                    if hasattr(self, 'save_best_model'):
+-                        self.save_best_model()
+-                    else:
+-                        self.save_model()
+-                    logging.info('Best model updated at epoch {}, val-acc {:.4f}'.format(best_epoch, best_acc))
+-            logging.info('The best model epoch {}, val-acc {:.4f}'.format(best_epoch, best_acc))
++            if bool(getattr(args, 'eval_each_epoch', True)):
++                new_acc = self.test()
++                if bool(getattr(args, 'select_best_on_target', True)):
++                    if new_acc >= best_acc:
++                        best_acc = new_acc
++                        best_epoch = epoch
++                        if getattr(args, 'save', False) and getattr(args, 'save_best', True):
++                            if hasattr(self, 'save_best_model'):
++                                self.save_best_model()
++                            else:
++                                self.save_model()
++                            logging.info(
++                                'Best model updated at epoch {}, target-test-acc {:.4f}'.format(
++                                    best_epoch, best_acc
++                                )
++                            )
++                    logging.info(
++                        'The best model epoch {}, target-test-acc {:.4f}'.format(
++                            best_epoch, best_acc
++                        )
++                    )
++                else:
++                    logging.info(
++                        'Target test was reported but not used for checkpoint selection.'
++                    )
+ 
+             if self.lr_scheduler is not None:
+                 self.lr_scheduler.step()
+ 
++        if not bool(getattr(args, 'eval_each_epoch', True)):
++            logging.info(
++                'Training finished; evaluating the held-out target set once (strict mode).'
++            )
++            self.test()
++
+     def _train_one_epoch(self, epoch_acc, epoch_loss):
+         self._cur_epoch = int(getattr(self, '_cur_epoch', 1))
+         weight_sum = torch.zeros(self.num_source, device=self.device)
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V8_CONFUSION_PROTO_ALIGNMENT.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V8_CONFUSION_PROTO_ALIGNMENT.py	2026-08-06 04:24:51.494372758 +0000
+@@ -163,8 +163,10 @@
+             'CE + MMD + CDAN + prototype-filtered CLMMD + Hard-SupCon.'
+         )
+         logging.info(
+-            'V8 protocol unchanged: target-test accuracy is still evaluated '
+-            'every epoch and still selects the best checkpoint.'
++            'Evaluation policy: eval_each_epoch={} select_best_on_target={}'.format(
++                bool(getattr(args, 'eval_each_epoch', True)),
++                bool(getattr(args, 'select_best_on_target', True)),
++            )
+         )
+ 
+     # ------------------------------------------------------------------
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V9_SPECIALIST_RADIUS_ALIGNMENT.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V9_SPECIALIST_RADIUS_ALIGNMENT.py	2026-08-06 04:24:51.494514849 +0000
+@@ -193,8 +193,10 @@
+             'CE + MMD + CDAN + radius-filtered CLMMD + soft Hard-SupCon.'
+         )
+         logging.info(
+-            'V9 protocol unchanged: target-test accuracy is still evaluated '
+-            'every epoch and still selects the best checkpoint.'
++            'Evaluation policy: eval_each_epoch={} select_best_on_target={}'.format(
++                bool(getattr(args, 'eval_each_epoch', True)),
++                bool(getattr(args, 'select_best_on_target', True)),
++            )
+         )
+ 
+     # ------------------------------------------------------------------
+--- /mnt/data/cwru_modified_work/PU_XinHuafen_Jianhua_Sunshi_PU0_Gaijin_V7-main/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V10_PAIRWISE_SPECIALIST_CALIBRATED.py	2026-08-04 02:23:48.000000000 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/models/MFSAN_CDAN_BIMAMBA_CW_RWCA_V10_PAIRWISE_SPECIALIST_CALIBRATED.py	2026-08-06 04:24:51.494641887 +0000
+@@ -174,8 +174,10 @@
+             'CE + MMD + CDAN + calibrated-radius CLMMD + pairwise Hard-SupCon.'
+         )
+         logging.info(
+-            'V10 protocol unchanged: target-test accuracy is still evaluated '
+-            'every epoch and still selects the best checkpoint.'
++            'Evaluation policy: eval_each_epoch={} select_best_on_target={}'.format(
++                bool(getattr(args, 'eval_each_epoch', True)),
++                bool(getattr(args, 'select_best_on_target', True)),
++            )
+         )
+ 
+     # ------------------------------------------------------------------
+--- /dev/null	2026-08-06 03:57:15.478858680 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/cwru_profile.py	2026-08-06 04:22:26.968220882 +0000
+@@ -0,0 +1,77 @@
++# -*- coding: utf-8 -*-
++"""CWRU-specific configuration helpers for the multi-source model."""
++
++import logging
++import os
++
++CWRU_CLASSES = [
++    "ball_07", "ball_14", "ball_21",
++    "inner_07", "inner_14", "inner_21",
++    "normal",
++    "outer_07", "outer_14", "outer_21",
++]
++
++
++def is_cwru_experiment(args):
++    names = list(getattr(args, "source_name", [])) + [getattr(args, "target", "")]
++    detected = bool(names) and all(str(name).split("_")[0].upper() == "CWRU" for name in names)
++    profile = str(getattr(args, "dataset_profile", "auto")).lower()
++    return profile == "cwru" or (profile == "auto" and detected)
++
++
++def apply_before_class_discovery(args):
++    """Apply settings that must be known before folder/class discovery."""
++    if not is_cwru_experiment(args):
++        return args
++
++    os.environ["CWRU_CHANNEL"] = str(getattr(args, "cwru_channel", "DE")).upper()
++    if not str(getattr(args, "include_faults", "")).strip():
++        args.include_faults = ",".join(CWRU_CLASSES)
++
++    if bool(getattr(args, "cwru_apply_general_defaults", True)):
++        # CWRU source files differ in length, so equalize labeled source windows.
++        args.source_balance_data = True
++        # Use all classes in ordinary SupCon.  The PU-specific hard pairs are not
++        # assumed to transfer to CWRU before a CWRU confusion analysis exists.
++        args.supcon_focus_classes = "all"
++        args.v7_class_gate_log_classes = "all"
++        args.v8_hard_supcon_enabled = False
++        args.v8_hard_negative_pairs = ""
++        args.v8_supcon_anchor_classes = "all"
++        args.v8_prototype_filter_enabled = False
++        args.v8_prototype_conf_overrides = ""
++        args.v8_clmmd_class_boost = ""
++        args.v8_prototype_log_classes = "all"
++        args.v9_prototype_filter_classes = "all"
++        args.v10_hard_pair_weights = ""
++        args.v10_radius_class_min = ""
++        args.v10_radius_class_max = ""
++
++    return args
++
++
++def apply_after_label_mapping(args):
++    """Infer semantic class indices after alphabetical label mapping."""
++    if not is_cwru_experiment(args):
++        return args
++
++    missing = [name for name in CWRU_CLASSES if name not in args.fault_label]
++    if missing:
++        raise ValueError(
++            "CWRU class folders are incomplete. Missing after filtering: " + ", ".join(missing)
++        )
++
++    args.v10_normal_class = int(args.fault_label["normal"])
++    args.class_names = [
++        name for name, _ in sorted(args.fault_label.items(), key=lambda item: item[1])
++    ]
++    logging.info("CWRU profile active; channel=%s", os.environ.get("CWRU_CHANNEL", "DE"))
++    logging.info("CWRU class mapping: %s", args.fault_label)
++    logging.info("CWRU normal class index for V10 guard: %d", args.v10_normal_class)
++    logging.info(
++        "CWRU general defaults: source_balance=%s hard_supcon=%s prototype_filter=%s",
++        args.source_balance_data,
++        args.v8_hard_supcon_enabled,
++        args.v8_prototype_filter_enabled,
++    )
++    return args
+--- /dev/null	2026-08-06 03:57:15.478858680 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/check_cwru_dataset.py	2026-08-06 04:22:57.395997551 +0000
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Validate the prepared CWRU_TL/CWRU directory before training."""
++
++import argparse
++import os
++from collections import Counter
++from pathlib import Path
++
++import numpy as np
++from scipy.io import loadmat
++
++from cwru_profile import CWRU_CLASSES
++
++
++def resolve_root(value):
++    path = Path(value).expanduser().resolve()
++    nested = path / "CWRU"
++    return nested if nested.is_dir() else path
++
++
++def load_channel(path, channel):
++    mat = loadmat(path)
++    suffix = f"_{channel}_time".lower()
++    keys = sorted(k for k in mat if not k.startswith("__") and k.lower().endswith(suffix))
++    if not keys:
++        raise KeyError(f"No *_{channel}_time variable; keys={[k for k in mat if not k.startswith('__')]}")
++    signal = np.asarray(mat[keys[0]]).reshape(-1)
++    return keys[0], signal
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--data_dir", required=True, help="CWRU_TL or CWRU directory")
++    parser.add_argument("--signal_size", type=int, default=1024)
++    parser.add_argument("--channel", choices=["DE", "FE", "BA"], default="DE")
++    args = parser.parse_args()
++
++    root = resolve_root(args.data_dir)
++    errors = []
++    total_windows = Counter()
++    print(f"Resolved CWRU root: {root}")
++
++    for condition in range(4):
++        for class_name in CWRU_CLASSES:
++            folder = root / f"condition_{condition}" / class_name
++            mats = sorted(folder.glob("*.mat")) if folder.is_dir() else []
++            if not mats:
++                errors.append(f"Missing .mat files: {folder}")
++                continue
++            for mat_path in mats:
++                try:
++                    key, signal = load_channel(mat_path, args.channel)
++                    if not np.isfinite(signal).all():
++                        raise ValueError("contains NaN/Inf")
++                    windows = len(signal) // args.signal_size
++                    if windows < 2:
++                        raise ValueError(f"only {windows} complete windows")
++                    total_windows[(condition, class_name)] += windows
++                    print(
++                        f"OK condition_{condition}/{class_name}/{mat_path.name}: "
++                        f"key={key}, length={len(signal)}, windows={windows}"
++                    )
++                except Exception as exc:
++                    errors.append(f"{mat_path}: {exc}")
++
++    print("\nWindow summary before target split:")
++    for condition in range(4):
++        values = [total_windows[(condition, c)] for c in CWRU_CLASSES]
++        print(f"condition_{condition}: min={min(values or [0])}, max={max(values or [0])}, {dict(zip(CWRU_CLASSES, values))}")
++
++    if errors:
++        print("\nFAILED:")
++        for item in errors:
++            print(" -", item)
++        raise SystemExit(1)
++    print("\nCWRU dataset check passed.")
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-08-06 03:57:15.478858680 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/run_cwru_v10.py	2026-08-06 04:22:57.396149646 +0000
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Run one or all CWRU multi-source transfer tasks with safe general defaults."""
++
++import argparse
++import subprocess
++import sys
++from pathlib import Path
++
++TASKS = {
++    0: ("CWRU_1,CWRU_2,CWRU_3", "CWRU_0"),
++    1: ("CWRU_0,CWRU_2,CWRU_3", "CWRU_1"),
++    2: ("CWRU_0,CWRU_1,CWRU_3", "CWRU_2"),
++    3: ("CWRU_0,CWRU_1,CWRU_2", "CWRU_3"),
++}
++
++
++def build_command(args, target_condition, seed):
++    source, target = TASKS[target_condition]
++    train_py = Path(__file__).resolve().parent / "train.py"
++    return [
++        sys.executable, str(train_py),
++        "--model_name", "MFSAN_CDAN_BIMAMBA_CW_RWCA_V10_PAIRWISE_SPECIALIST_CALIBRATED",
++        "--dataset_profile", "cwru",
++        "--cwru_apply_general_defaults", "True",
++        "--source", source,
++        "--target", target,
++        "--train_mode", "multi_source",
++        "--data_dir", str(Path(args.data_dir).expanduser()),
++        "--signal_size", str(args.signal_size),
++        "--backbone", "CNN",
++        "--cuda_device", args.cuda_device,
++        "--max_epoch", str(args.max_epoch),
++        "--batch_size", str(args.batch_size),
++        "--num_workers", str(args.num_workers),
++        "--random_state", str(seed),
++        "--target_test_size", str(args.target_test_size),
++        "--target_split_mode", "time",
++        "--lambda_l1", "0.0",
++        "--lambda_cda", "0.0",
++        "--lambda_ent", "0.0",
++        "--lambda_mca", "0.0",
++        "--lambda_adv", "0.02",
++        "--lambda_clmmd", "0.005",
++        "--lambda_supcon", "0.01",
++        "--supcon_temperature", "0.20",
++        "--supcon_start_epoch", "3",
++        "--supcon_feature_mode", "G",
++        "--supcon_focus_classes", "all",
++        "--pl_conf_thresh", "0.80",
++        "--pl_min_target", "2",
++        "--rec_score_weight", "0.30",
++        "--v7_class_gate_enabled", "True",
++        "--v7_class_gate_log_classes", "all",
++        "--v7_conflict_fusion_enabled", "True",
++        "--v8_hard_supcon_enabled", "False",
++        "--v8_prototype_filter_enabled", "False",
++        "--source_balance_data", "True",
++        "--eval_each_epoch", str(args.eval_each_epoch),
++        "--select_best_on_target", str(args.select_best_on_target),
++        "--save_best", str(args.select_best_on_target),
++        "--save_dir", args.save_dir,
++    ]
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--data_dir", required=True, help="Path to CWRU_TL or CWRU")
++    parser.add_argument("--targets", default="0,1,2,3", help="Target conditions, e.g. 0 or 0,1,2,3")
++    parser.add_argument("--seeds", default="2027", help="Seeds, e.g. 2027,2028,2029")
++    parser.add_argument("--cuda_device", default="0", help="Use empty string for CPU")
++    parser.add_argument("--max_epoch", type=int, default=20)
++    parser.add_argument("--batch_size", type=int, default=64)
++    parser.add_argument("--num_workers", type=int, default=4)
++    parser.add_argument("--signal_size", type=int, default=1024)
++    parser.add_argument("--target_test_size", type=float, default=0.40)
++    parser.add_argument("--save_dir", default="./ckpt/CWRU_V10_GENERAL")
++    parser.add_argument("--eval_each_epoch", choices=["True", "False"], default="False")
++    parser.add_argument("--select_best_on_target", choices=["True", "False"], default="False")
++    args = parser.parse_args()
++
++    targets = [int(x) for x in args.targets.split(",") if x.strip()]
++    seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
++    for target in targets:
++        if target not in TASKS:
++            raise ValueError(f"Unknown target condition {target}; use 0,1,2,3")
++        for seed in seeds:
++            cmd = build_command(args, target, seed)
++            print("\nRUN:", " ".join(cmd), flush=True)
++            subprocess.run(cmd, check=True)
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null	2026-08-06 03:57:15.478858680 +0000
++++ /mnt/data/MFSAN_BiMamba_CWRU_complete/README_CWRU_COMPLETE.md	2026-08-06 04:22:26.968748626 +0000
+@@ -0,0 +1,84 @@
++# CWRU complete adaptation version
++
++This project is the uploaded multi-source BiMamba/RWCA model modified for the
++folder structure:
++
++```
++CWRU_TL/CWRU/
++  condition_0/{ball_07,...,outer_21}/*.mat
++  condition_1/{ball_07,...,outer_21}/*.mat
++  condition_2/{ball_07,...,outer_21}/*.mat
++  condition_3/{ball_07,...,outer_21}/*.mat
++```
++
++## What was changed
++
++1. Robust CWRU `.mat` reader: variable discovery no longer depends on filenames.
++2. `--data_dir` accepts either the parent `CWRU_TL` or the `CWRU` directory itself.
++3. Automatic 10-class mapping and automatic V10 normal-class index (`normal` = 6
++   under alphabetical ordering).
++4. Source-domain class balancing is enabled by the CWRU profile.
++5. PU-specific hard-negative pairs/prototype calibration are disabled until a
++   CWRU confusion matrix supports new class-pair choices.
++6. Strict evaluation mode can test the target set only once after training.
++
++## 1. Check the dataset
++
++Linux/macOS:
++
++```bash
++python check_cwru_dataset.py --data_dir /workspace/CWRU_TL --signal_size 1024
++```
++
++Windows example:
++
++```powershell
++python check_cwru_dataset.py --data_dir D:\CWRU_TL --signal_size 1024
++```
++
++## 2. Run one task
++
++Target condition 3, sources 0/1/2:
++
++```bash
++python run_cwru_v10.py --data_dir /workspace/CWRU_TL --targets 3 --seeds 2027
++```
++
++Windows:
++
++```powershell
++python run_cwru_v10.py --data_dir D:\CWRU_TL --targets 3 --seeds 2027
++```
++
++## 3. Run four tasks and three seeds
++
++```bash
++python run_cwru_v10.py   --data_dir /workspace/CWRU_TL   --targets 0,1,2,3   --seeds 2027,2028,2029
++```
++
++By default the launcher uses strict reporting:
++
++- `--eval_each_epoch False`
++- `--select_best_on_target False`
++
++The target held-out set is evaluated once after the final epoch.  To reproduce
++the old protocol, explicitly pass both options as `True`, but that uses target
++labels for checkpoint selection and is not recommended for final thesis results.
++
++## Class indices
++
++| id | folder |
++|---:|---|
++| 0 | ball_07 |
++| 1 | ball_14 |
++| 2 | ball_21 |
++| 3 | inner_07 |
++| 4 | inner_14 |
++| 5 | inner_21 |
++| 6 | normal |
++| 7 | outer_07 |
++| 8 | outer_14 |
++| 9 | outer_21 |
++
++The model automatically changes from 9 to 10 outputs. CDAN joint features
++change from `9 x 40 = 360` to `10 x 40 = 400` without manual layer edits.

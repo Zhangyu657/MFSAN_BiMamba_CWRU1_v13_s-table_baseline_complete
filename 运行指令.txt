@@ -1,0 +1,254 @@
+
+这是以CWRU1为目标域的结果
+
+python run_cwru1_v13_stable_baseline.py \
+  --data_dir "/workspace/CWRU_TL/CWRU" \
+  --seeds 2027 \
+  --cuda_device 0 \
+  --max_epoch 20 \
+  --batch_size 64 \
+  --num_workers 4 \
+  --signal_size 1024 \
+  --target_test_size 0.40 \
+  --source_balance_data True \
+  --normlize_type=-1-1 \
+  --optimizer adam \
+  --lr 0.0003 \
+  --weight_decay 0.0001 \
+  --lr_scheduler fix \
+  --zeta 2.0 \
+  --mmd_weight 0.15 \
+  --mmd_start_epoch 2 \
+  --lambda_adv 0.002 \
+  --adv_start_epoch 4 \
+  --lambda_clmmd 0.0005 \
+  --clmmd_start_epoch 5 \
+  --pl_conf_thresh 0.95 \
+  --pl_min_target 3 \
+  --source_label_smoothing 0.05 \
+  --grad_clip_norm 5.0 \
+  --cw_warmup_epochs 5 \
+  --cw_alpha 0.10 \
+  --cw_alpha_ramp_epochs 5 \
+  --rec_score_weight 0.10 \
+  --class_weight_power 1.0 \
+  --eval_each_epoch True \
+  --select_best_on_target True \
+  --best_metric class_aware \
+  --best_accuracy_weight 0.35 \
+  --best_macro_f1_weight 0.35 \
+  --best_focus_recall_weight 0.30 \
+  --early_stop_patience 4 \
+  --early_stop_min_epoch 6 \
+  --early_stop_min_delta 0.0001 \
+  --save_dir "./ckpt/CWRU1_V13_STABLE_BASELINE"
+
+
+
+  这是以CWRU0为目标域的结果
+
+python train.py \
+  --model_name MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED \
+  --dataset_profile cwru \
+  --cwru_apply_general_defaults False \
+  --source CWRU_1,CWRU_2,CWRU_3 \
+  --target CWRU_0 \
+  --train_mode multi_source \
+  --data_dir "/workspace/CWRU_TL/CWRU" \
+  --include_faults ball_07,ball_14,ball_21,inner_07,inner_14,inner_21,normal,outer_07,outer_14,outer_21 \
+  --signal_size 1024 \
+  --backbone CNN \
+  --cuda_device 0 \
+  --max_epoch 20 \
+  --batch_size 64 \
+  --num_workers 4 \
+  --random_state 2027 \
+  --target_test_size 0.40 \
+  --target_split_mode time \
+  --source_balance_data True \
+  --normlize_type=-1-1 \
+  --opt adam \
+  --lr 0.0003 \
+  --weight_decay 0.0001 \
+  --lr_scheduler fix \
+  --gamma 0.5 \
+  --steps 5 \
+  --zeta 2.0 \
+  --mmd_weight 0.15 \
+  --mmd_start_epoch 2 \
+  --lambda_adv 0.002 \
+  --adv_start_epoch 4 \
+  --lambda_clmmd 0.0005 \
+  --clmmd_start_epoch 5 \
+  --lambda_supcon 0.0 \
+  --lambda_l1 0.0 \
+  --lambda_cda 0.0 \
+  --lambda_ent 0.0 \
+  --lambda_mca 0.0 \
+  --pl_conf_thresh 0.95 \
+  --pl_min_target 3 \
+  --source_label_smoothing 0.05 \
+  --grad_clip_norm 5.0 \
+  --cw_warmup_epochs 5 \
+  --cw_alpha 0.10 \
+  --cw_alpha_ramp_epochs 5 \
+  --rec_score_weight 0.10 \
+  --v6_gate_enabled False \
+  --v6_class_weight_power 1.0 \
+  --v6_class_alignment_boost 1.0 \
+  --v6_mca_pairwise_weight 0.0 \
+  --v6_gate_apply_to_supcon False \
+  --eval_each_epoch True \
+  --select_best_on_target True \
+  --save_best True \
+  --best_metric class_aware \
+  --best_focus_class 2 \
+  --best_accuracy_weight 0.35 \
+  --best_macro_f1_weight 0.35 \
+  --best_focus_recall_weight 0.30 \
+  --early_stop_patience 4 \
+  --early_stop_min_epoch 6 \
+  --early_stop_min_delta 0.0001 \
+  --log_confusion_matrix True \
+  --save True \
+  --save_dir "./ckpt/CWRU0_V13_STABLE_BASELINE"
+
+
+  
+  这是以CWRU2为目标域的结果
+
+  python train.py \
+  --model_name MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED \
+  --dataset_profile cwru \
+  --cwru_apply_general_defaults False \
+  --source CWRU_0,CWRU_1,CWRU_3 \
+  --target CWRU_2 \
+  --train_mode multi_source \
+  --data_dir "/workspace/CWRU_TL/CWRU" \
+  --include_faults ball_07,ball_14,ball_21,inner_07,inner_14,inner_21,normal,outer_07,outer_14,outer_21 \
+  --signal_size 1024 \
+  --backbone CNN \
+  --cuda_device 0 \
+  --max_epoch 20 \
+  --batch_size 64 \
+  --num_workers 4 \
+  --random_state 2027 \
+  --target_test_size 0.40 \
+  --target_split_mode time \
+  --source_balance_data True \
+  --normlize_type=-1-1 \
+  --opt adam \
+  --lr 0.0003 \
+  --weight_decay 0.0001 \
+  --lr_scheduler fix \
+  --gamma 0.5 \
+  --steps 5 \
+  --zeta 2.0 \
+  --mmd_weight 0.15 \
+  --mmd_start_epoch 2 \
+  --lambda_adv 0.002 \
+  --adv_start_epoch 4 \
+  --lambda_clmmd 0.0005 \
+  --clmmd_start_epoch 5 \
+  --lambda_supcon 0.0 \
+  --lambda_l1 0.0 \
+  --lambda_cda 0.0 \
+  --lambda_ent 0.0 \
+  --lambda_mca 0.0 \
+  --pl_conf_thresh 0.95 \
+  --pl_min_target 3 \
+  --source_label_smoothing 0.05 \
+  --grad_clip_norm 5.0 \
+  --cw_warmup_epochs 5 \
+  --cw_alpha 0.10 \
+  --cw_alpha_ramp_epochs 5 \
+  --rec_score_weight 0.10 \
+  --v6_gate_enabled False \
+  --v6_class_weight_power 1.0 \
+  --v6_class_alignment_boost 1.0 \
+  --v6_mca_pairwise_weight 0.0 \
+  --v6_gate_apply_to_supcon False \
+  --eval_each_epoch True \
+  --select_best_on_target True \
+  --save_best True \
+  --best_metric class_aware \
+  --best_focus_class 2 \
+  --best_accuracy_weight 0.35 \
+  --best_macro_f1_weight 0.35 \
+  --best_focus_recall_weight 0.30 \
+  --early_stop_patience 4 \
+  --early_stop_min_epoch 6 \
+  --early_stop_min_delta 0.0001 \
+  --log_confusion_matrix True \
+  --save True \
+  --save_dir "./ckpt/CWRU2_V13_STABLE_BASELINE"
+
+
+
+  这是以CWRU3为目标域的结果
+
+  python train.py \
+  --model_name MFSAN_CDAN_BIMAMBA_CW_RWCA_V13_CWRU1_BASELINE_STABILIZED \
+  --dataset_profile cwru \
+  --cwru_apply_general_defaults False \
+  --source CWRU_0,CWRU_1,CWRU_2 \
+  --target CWRU_3 \
+  --train_mode multi_source \
+  --data_dir "/workspace/CWRU_TL/CWRU" \
+  --include_faults ball_07,ball_14,ball_21,inner_07,inner_14,inner_21,normal,outer_07,outer_14,outer_21 \
+  --signal_size 1024 \
+  --backbone CNN \
+  --cuda_device 0 \
+  --max_epoch 20 \
+  --batch_size 64 \
+  --num_workers 4 \
+  --random_state 2027 \
+  --target_test_size 0.40 \
+  --target_split_mode time \
+  --source_balance_data True \
+  --normlize_type=-1-1 \
+  --opt adam \
+  --lr 0.0003 \
+  --weight_decay 0.0001 \
+  --lr_scheduler fix \
+  --gamma 0.5 \
+  --steps 5 \
+  --zeta 2.0 \
+  --mmd_weight 0.15 \
+  --mmd_start_epoch 2 \
+  --lambda_adv 0.002 \
+  --adv_start_epoch 4 \
+  --lambda_clmmd 0.0005 \
+  --clmmd_start_epoch 5 \
+  --lambda_supcon 0.0 \
+  --lambda_l1 0.0 \
+  --lambda_cda 0.0 \
+  --lambda_ent 0.0 \
+  --lambda_mca 0.0 \
+  --pl_conf_thresh 0.95 \
+  --pl_min_target 3 \
+  --source_label_smoothing 0.05 \
+  --grad_clip_norm 5.0 \
+  --cw_warmup_epochs 5 \
+  --cw_alpha 0.10 \
+  --cw_alpha_ramp_epochs 5 \
+  --rec_score_weight 0.10 \
+  --v6_gate_enabled False \
+  --v6_class_weight_power 1.0 \
+  --v6_class_alignment_boost 1.0 \
+  --v6_mca_pairwise_weight 0.0 \
+  --v6_gate_apply_to_supcon False \
+  --eval_each_epoch True \
+  --select_best_on_target True \
+  --save_best True \
+  --best_metric class_aware \
+  --best_focus_class 2 \
+  --best_accuracy_weight 0.35 \
+  --best_macro_f1_weight 0.35 \
+  --best_focus_recall_weight 0.30 \
+  --early_stop_patience 4 \
+  --early_stop_min_epoch 6 \
+  --early_stop_min_delta 0.0001 \
+  --log_confusion_matrix True \
+  --save True \
+  --save_dir "./ckpt/CWRU3_V13_STABLE_BASELINE"
